@@ -93,7 +93,9 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<IpAddr, St
             return Err(format!("domain blocked by DNS filter: {host}"));
         }
         if is_private_ip(&ip) {
-            return Err(format!("domain resolved to private IP, blocked: {host} -> {ip}"));
+            return Err(format!(
+                "domain resolved to private IP, blocked: {host} -> {ip}"
+            ));
         }
         return Ok(ip);
     }
@@ -374,7 +376,9 @@ mod tests {
 
         // IPv6 unique-local (fc00::/7)
         assert!(is_private_ip(&IpAddr::V6("fc00::1".parse().unwrap())));
-        assert!(is_private_ip(&IpAddr::V6("fd12:3456:789a::1".parse().unwrap())));
+        assert!(is_private_ip(&IpAddr::V6(
+            "fd12:3456:789a::1".parse().unwrap()
+        )));
 
         // IPv6 link-local (fe80::/10)
         assert!(is_private_ip(&IpAddr::V6("fe80::1".parse().unwrap())));
@@ -383,7 +387,9 @@ mod tests {
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
-        assert!(!is_private_ip(&IpAddr::V6("2001:4860:4860::8888".parse().unwrap())));
+        assert!(!is_private_ip(&IpAddr::V6(
+            "2001:4860:4860::8888".parse().unwrap()
+        )));
     }
 
     #[test]

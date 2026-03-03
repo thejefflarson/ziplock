@@ -20,10 +20,7 @@ const DOH_ENDPOINT: &str = "/dns-query";
 /// This DNS server blocks known malware and adult content domains by returning 0.0.0.0.
 /// DoH ensures DNS queries are encrypted and authenticated, preventing interception.
 pub fn create_resolver() -> Result<Arc<TokioResolver>> {
-    let mut ns = NameServerConfig::new(
-        SocketAddr::new(CLOUDFLARE_FAMILY_IP, 443),
-        Protocol::Https,
-    );
+    let mut ns = NameServerConfig::new(SocketAddr::new(CLOUDFLARE_FAMILY_IP, 443), Protocol::Https);
     ns.tls_dns_name = Some(CLOUDFLARE_FAMILY_SNI.to_string());
     ns.http_endpoint = Some(DOH_ENDPOINT.to_string());
 

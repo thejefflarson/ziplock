@@ -86,7 +86,8 @@ fn sandboxed_write_cwd_only() {
     let cwd = Path::new("/tmp/ziplock-e2e-write");
     std::fs::create_dir_all(cwd).ok();
 
-    let profile = ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None).unwrap();
+    let profile =
+        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None).unwrap();
 
     std::io::stdout().flush().ok();
     std::io::stderr().flush().ok();
@@ -239,7 +240,11 @@ fn claude_responds_in_sandbox() {
 
     let profile_for_closure = profile.clone();
     let mut cmd = Command::new(&claude_path);
-    cmd.args(["--dangerously-skip-permissions", "-p", "Reply with exactly: ZIPLOCK_OK"]);
+    cmd.args([
+        "--dangerously-skip-permissions",
+        "-p",
+        "Reply with exactly: ZIPLOCK_OK",
+    ]);
     cmd.current_dir(cwd);
     cmd.env("TMPDIR", "/tmp/claude");
     // Clear nested-session detection so test works when run from inside Claude Code
