@@ -42,13 +42,10 @@ fn already_sandboxed() -> bool {
             }
             std::process::exit(0); // not sandboxed
         }
-        nix::unistd::ForkResult::Parent { child } => {
-            use nix::sys::wait::WaitStatus;
-            match nix::sys::wait::waitpid(child, None).expect("waitpid failed") {
-                WaitStatus::Exited(_, 0) => false,
-                _ => true,
-            }
-        }
+        nix::unistd::ForkResult::Parent { child } => !matches!(
+            nix::sys::wait::waitpid(child, None).expect("waitpid failed"),
+            nix::sys::wait::WaitStatus::Exited(_, 0)
+        ),
     }
 }
 
