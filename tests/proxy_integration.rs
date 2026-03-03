@@ -77,6 +77,7 @@ mod socks5 {
     }
 
     #[tokio::test]
+    #[ignore] // requires outbound network (DNS to 1.1.1.3 + TCP to example.com) — run with `cargo test -- --ignored`
     async fn resolves_real_domain() {
         let resolver = ziplock::dns::create_resolver().unwrap();
         let (ports, _shutdown) = ziplock::proxy::start(resolver).await.unwrap();

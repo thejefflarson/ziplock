@@ -11,7 +11,7 @@ Claude Code's `--dangerously-skip-permissions` flag enables fully autonomous ope
 ### Two-layer architecture
 
 **Layer 1 — macOS Seatbelt Sandbox (via sandbox_init FFI):**
-- Default deny writes, allow only CWD, /tmp, ~/.claude, ~/.local/share/claude
+- Default deny writes, allow CWD, /tmp, and $HOME (excluding ~/Library)
 - Allow reads everywhere except ~/Library, /Library, /System (with framework carve-outs)
 - Force all network through localhost only
 - Applied via `sandbox_init()` FFI in `pre_exec`, not `sandbox-exec`

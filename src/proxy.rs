@@ -57,7 +57,12 @@ pub async fn start(resolver: Arc<TokioResolver>) -> Result<(ProxyPorts, watch::S
 pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            v6.is_loopback()
+                || (s[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
     }
 }
 
@@ -86,6 +91,9 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<IpAddr, St
     if let Some(ip) = response.iter().next() {
         if is_blocked_ip(&ip) {
             return Err(format!("domain blocked by DNS filter: {host}"));
+        }
+        if is_private_ip(&ip) {
+            return Err(format!("domain resolved to private IP, blocked: {host} -> {ip}"));
         }
         return Ok(ip);
     }
@@ -364,10 +372,18 @@ mod tests {
         // Link-local
         assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1))));
 
+        // IPv6 unique-local (fc00::/7)
+        assert!(is_private_ip(&IpAddr::V6("fc00::1".parse().unwrap())));
+        assert!(is_private_ip(&IpAddr::V6("fd12:3456:789a::1".parse().unwrap())));
+
+        // IPv6 link-local (fe80::/10)
+        assert!(is_private_ip(&IpAddr::V6("fe80::1".parse().unwrap())));
+
         // Public IPs should NOT be private
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+        assert!(!is_private_ip(&IpAddr::V6("2001:4860:4860::8888".parse().unwrap())));
     }
 
     #[test]

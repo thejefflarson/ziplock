@@ -9,6 +9,13 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tracing::{info, warn};
 
+/// Default log file location: ~/.claude/ziplock.log
+fn log_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".claude").join("ziplock.log"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/ziplock.log"))
+}
+
 #[derive(Parser)]
 #[command(
     name = "ziplock",
@@ -47,7 +54,17 @@ async fn main() -> ExitCode {
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
-    // Set up tracing
+    // Set up tracing — write to a file so we don't corrupt Claude's TUI on stderr
+    let log_file_path = log_path();
+    if let Some(parent) = log_file_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .context("failed to open log file")?;
+
     let filter = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -55,7 +72,8 @@ async fn run() -> Result<ExitCode> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
         )
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_ansi(false)
         .init();
 
     // Pre-flight checks
@@ -100,9 +118,8 @@ async fn run() -> Result<ExitCode> {
     info!("claude started with PID {}", child.id());
 
     // Set up signal forwarding
-    let child_pid_for_signal = child_pid;
     tokio::spawn(async move {
-        signal_forward(child_pid_for_signal).await;
+        signal_forward(child_pid).await;
     });
 
     // Wait for child to exit
