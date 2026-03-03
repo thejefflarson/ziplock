@@ -17,17 +17,35 @@ unsafe extern "C" {
 }
 
 /// Returns true if we're already running inside a sandbox (nested sandbox_init is forbidden).
+///
+/// Uses a fork-based probe to avoid applying a sandbox to the calling process as a side effect
+/// (sandbox_init is irreversible, so we must test it in a disposable child).
 fn already_sandboxed() -> bool {
-    let profile = c"(version 1)(allow default)";
-    let mut errorbuf: *mut c_char = std::ptr::null_mut();
-    let ret = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
-    if ret != 0 {
-        if !errorbuf.is_null() {
-            unsafe { sandbox_free_error(errorbuf) };
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
+
+    match unsafe { nix::unistd::fork() }.expect("fork failed") {
+        nix::unistd::ForkResult::Child => {
+            let profile = c"(version 1)(allow default)";
+            let mut errorbuf: *mut c_char = std::ptr::null_mut();
+            let ret = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
+            if ret != 0 {
+                if !errorbuf.is_null() {
+                    unsafe { sandbox_free_error(errorbuf) };
+                }
+                std::process::exit(1); // nested sandbox detected
+            }
+            std::process::exit(0); // not sandboxed
         }
-        return true;
+        nix::unistd::ForkResult::Parent { child } => {
+            use nix::sys::wait::WaitStatus;
+            match nix::sys::wait::waitpid(child, None).expect("waitpid failed") {
+                WaitStatus::Exited(_, 0) => false,
+                _ => true,
+            }
+        }
     }
-    false
 }
 
 /// Apply a sandbox profile to the current process (irreversible).
@@ -96,6 +114,7 @@ fn sandbox_blocks_writes_outside_allowed_paths() {
         Path::new(&home),
         &[],
         true,
+        None,
     )
     .unwrap();
 
@@ -133,6 +152,7 @@ fn sandbox_blocks_reads_to_library() {
         Path::new(&home),
         &[],
         true,
+        None,
     )
     .unwrap();
 
@@ -172,6 +192,7 @@ fn sandbox_allows_reads_to_productivity_creds() {
         Path::new(&home),
         &[],
         true,
+        None,
     )
     .unwrap();
 
@@ -201,6 +222,7 @@ fn sandbox_allows_framework_reads() {
         Path::new(&home),
         &[],
         true,
+        None,
     )
     .unwrap();
 
@@ -235,6 +257,7 @@ fn sandbox_extra_allow_path() {
         Path::new(&home),
         &[PathBuf::from("/tmp/ziplock-extra-allowed")],
         true,
+        None,
     )
     .unwrap();
 

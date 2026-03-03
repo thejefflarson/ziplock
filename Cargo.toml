@@ -6,7 +6,7 @@ description = "Safe --dangerously-skip-permissions for Claude Code"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-hickory-resolver = "0.25"
+hickory-resolver = { version = "0.25", features = ["https-ring", "webpki-roots"] }
 fast-socks5 = "1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

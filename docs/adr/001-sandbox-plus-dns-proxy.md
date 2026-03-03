@@ -19,7 +19,7 @@ Claude Code's `--dangerously-skip-permissions` flag enables fully autonomous ope
 **Layer 2 — DNS-Filtering Proxy:**
 - SOCKS5 proxy for `ALL_PROXY=socks5h://` (h = proxy-side DNS)
 - HTTP CONNECT proxy for `HTTP_PROXY`/`HTTPS_PROXY`
-- All DNS resolved through Cloudflare 1.1.1.3 (blocks malware + adult content)
+- All DNS resolved via DoH (DNS-over-HTTPS) to Cloudflare 1.1.1.3 — blocks malware + adult content; encrypted to prevent interception (see ADR 003)
 - Raw public IPs blocked; private/RFC1918 IPs allowed
 
 ### Key tradeoffs

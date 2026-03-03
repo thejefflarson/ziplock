@@ -35,6 +35,7 @@ pub fn generate_profile(
     home: &Path,
     allow_paths: &[PathBuf],
     allow_network: bool,
+    ssh_agent_dir: Option<&Path>,
 ) -> Result<String> {
     let cwd_str = sanitize_sbpl_path(cwd)?;
     let home_str = sanitize_sbpl_path(home)?;
@@ -44,6 +45,13 @@ pub fn generate_profile(
         let safe = sanitize_sbpl_path(path)?;
         extra_write_rules.push_str(&format!("    (subpath \"{safe}\")\n"));
     }
+
+    let ssh_agent_rule = if let Some(dir) = ssh_agent_dir {
+        let safe = sanitize_sbpl_path(dir)?;
+        format!("    (subpath \"{safe}\")\n")
+    } else {
+        String::new()
+    };
 
     let network_rules = if allow_network {
         "  (allow network*)".to_string()
@@ -92,7 +100,9 @@ pub fn generate_profile(
     (subpath "/Library/Frameworks")
     (subpath "/Library/Developer")
     (subpath "/Library/Apple")
-    (subpath "{home_str}/Library/Preferences"))
+    (subpath "{home_str}/Library/Preferences")
+    (subpath "{home_str}/Library/Caches")
+{ssh_agent_rule})
 
 ;; ── File writes ────────────────────────────────────────────────────────
 ;; Allow writes to home dir broadly (excluding sensitive ~/Library subtree)
@@ -108,6 +118,9 @@ pub fn generate_profile(
 ;; Block writes to sensitive home subdirectory
 (deny file-write*
     (subpath "{home_str}/Library"))
+;; Re-allow caches (build tools: Go, npm, pip, Homebrew, etc.)
+(allow file-write*
+    (subpath "{home_str}/Library/Caches"))
 
 ;; ── Network ──────────────────────────────────────────────────────────────
 {network_rules}
@@ -148,6 +161,24 @@ pub fn generate_profile(
     ))
 }
 
+/// Scan ~/Library/Group Containers/ for a 1Password SSH agent socket.
+/// Returns the directory containing agent.sock (to pass as ssh_agent_dir to generate_profile).
+fn find_op_agent_socket(home: &Path) -> Option<PathBuf> {
+    let group_containers = home.join("Library/Group Containers");
+    let entries = std::fs::read_dir(&group_containers).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().to_lowercase();
+        if name_str.contains("1password") || name_str.contains("agilebits") {
+            let agent_sock = entry.path().join("t/agent.sock");
+            if agent_sock.exists() {
+                return agent_sock.parent().map(|p| p.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
 /// Spawn the claude process with sandbox applied via pre_exec.
 pub fn spawn_claude(
     claude_path: &Path,
@@ -158,7 +189,9 @@ pub fn spawn_claude(
     allow_network: bool,
     ports: &ProxyPorts,
 ) -> Result<std::process::Child> {
-    let profile = generate_profile(cwd, home, allow_paths, allow_network)?;
+    // Detect 1Password SSH agent socket for git operations
+    let ssh_agent_dir = find_op_agent_socket(home);
+    let profile = generate_profile(cwd, home, allow_paths, allow_network, ssh_agent_dir.as_deref())?;
     debug!("SBPL profile:\n{profile}");
 
     let mut cmd = Command::new(claude_path);
@@ -166,8 +199,15 @@ pub fn spawn_claude(
     cmd.args(claude_args);
     cmd.current_dir(cwd);
 
-    // Clear nested-session detection so ziplock works when launched from inside Claude Code
+    // Claude Code refuses to launch if CLAUDECODE is set (nested-session guard).
+    // Strip it so ziplock can be run from a Claude Code terminal during development.
     cmd.env_remove("CLAUDECODE");
+
+    // Set SSH_AUTH_SOCK to 1Password agent if found
+    if let Some(ref dir) = ssh_agent_dir {
+        cmd.env("SSH_AUTH_SOCK", dir.join("agent.sock"));
+        debug!("SSH_AUTH_SOCK -> {}", dir.join("agent.sock").display());
+    }
 
     // Set proxy env vars
     if !allow_network {
@@ -240,6 +280,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
         )
         .unwrap();
         assert!(profile.contains(r#"(subpath "/Users/test/project")"#));
@@ -254,6 +295,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
         )
         .unwrap();
         assert!(profile.contains(r#"(subpath "/Users/test/Library")"#));
@@ -264,16 +306,31 @@ mod tests {
     #[test]
     fn profile_has_framework_carveouts() {
         let profile =
-            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false).unwrap();
+            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false, None).unwrap();
         assert!(profile.contains(r#"(subpath "/System/Library/Frameworks")"#));
         assert!(profile.contains(r#"(subpath "/Library/Developer")"#));
         assert!(profile.contains(r#"(subpath "/Library/Apple")"#));
     }
 
     #[test]
+    fn profile_allows_library_caches() {
+        let profile =
+            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false, None).unwrap();
+        // ~/Library/Caches must be readable (Go module cache, npm, pip, etc.)
+        assert!(profile.contains(r#"(subpath "/Users/test/Library/Caches")"#));
+        // The allow for Caches must appear after the deny for ~/Library (last match wins in SBPL)
+        let deny_pos = profile.find(r#"(deny file-write*"#).unwrap();
+        let caches_allow_pos = profile.rfind(r#"(subpath "/Users/test/Library/Caches")"#).unwrap();
+        assert!(
+            caches_allow_pos > deny_pos,
+            "Caches write allow must come after ~/Library write deny"
+        );
+    }
+
+    #[test]
     fn profile_localhost_only_network_by_default() {
         let profile =
-            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false).unwrap();
+            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false, None).unwrap();
         assert!(profile.contains(r#"(remote ip "localhost:*")"#));
         assert!(!profile.contains("(allow network*)"));
     }
@@ -281,7 +338,7 @@ mod tests {
     #[test]
     fn profile_allow_network_flag() {
         let profile =
-            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], true).unwrap();
+            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], true, None).unwrap();
         assert!(profile.contains("(allow network*)"));
         assert!(!profile.contains(r#"(remote ip "localhost:*")"#));
     }
@@ -293,6 +350,7 @@ mod tests {
             Path::new("/Users/test"),
             &[PathBuf::from("/extra/path"), PathBuf::from("/another/path")],
             false,
+            None,
         )
         .unwrap();
         assert!(profile.contains(r#"(subpath "/extra/path")"#));
@@ -308,6 +366,7 @@ mod tests {
                 r#"/tmp/evil")(allow network*)(subpath "/tmp"#,
             )],
             false,
+            None,
         );
         assert!(result.is_err());
     }
@@ -319,6 +378,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
         );
         assert!(result.is_err());
     }
@@ -326,7 +386,7 @@ mod tests {
     #[test]
     fn profile_has_file_ioctl_for_tty() {
         let profile =
-            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false).unwrap();
+            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false, None).unwrap();
         assert!(
             profile.contains("(allow file-ioctl"),
             "profile should allow file-ioctl for TTY devices (needed for setRawMode)"
@@ -335,9 +395,27 @@ mod tests {
     }
 
     #[test]
+    fn profile_ssh_agent_carveout() {
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            Some(Path::new("/Users/test/Library/Group Containers/2BUA8C4S2C.com.1password/t")),
+        )
+        .unwrap();
+        assert!(
+            profile.contains(
+                r#"(subpath "/Users/test/Library/Group Containers/2BUA8C4S2C.com.1password/t")"#
+            ),
+            "SSH agent dir should appear as a file-read carve-out"
+        );
+    }
+
+    #[test]
     fn profile_no_security_server_mach_lookup() {
         let profile =
-            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false).unwrap();
+            generate_profile(Path::new("/tmp/proj"), Path::new("/Users/test"), &[], false, None).unwrap();
         assert!(
             !profile.contains("com.apple.SecurityServer"),
             "SecurityServer Mach IPC should not be whitelisted (keychain bypass)"

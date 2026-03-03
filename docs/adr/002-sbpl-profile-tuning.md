@@ -46,13 +46,9 @@ The initial write allowlist (CWD, /tmp, ~/.claude, ~/.local/share/claude) caused
 
 **Tradeoff:** This is broader than ideal but necessary for real-world usability. The deny on `~/Library` still protects keychains, cookies, and browser data.
 
-### 3. `CLAUDECODE` environment variable must be removed
+`~/Library/Caches` is re-allowed after the deny (SBPL last-match-wins) for both reads and writes. Build tools — Go module cache, npm, pip, Homebrew, Xcode derived data — store data there and will fail or hang without it.
 
-Claude Code sets `CLAUDECODE=1` in its environment and detects this variable to refuse launching inside another Claude Code session ("Claude Code cannot be launched inside another Claude Code session").
-
-**Fix:** `cmd.env_remove("CLAUDECODE")` before spawning the child process.
-
-### 4. `(with report)` is not supported on all macOS versions
+### 3. `(with report)` is not supported on all macOS versions
 
 Attempting to add `(deny default (with report))` for sandbox violation logging fails with:
 
@@ -62,15 +58,22 @@ sandbox compile: report modifier does not apply to deny action
 
 The `(with report)` modifier is unsupported on the user's macOS version. Sandbox violations can still be observed via `log stream --predicate 'subsystem == "com.apple.sandbox"'`.
 
-### 5. Debug flags retained in release builds
+### 5. Tracing writes to a file, not stderr
 
-Two flags are kept for production use (not stripped as debug-only):
+`tracing_subscriber` is configured with a `Mutex<File>` writer targeting `~/.claude/ziplock.log`. Writing to stderr corrupted Claude Code's TUI (which owns the terminal in raw mode). The log path falls back to `/tmp/ziplock.log` if `$HOME` is unset.
 
-- `--no-sandbox`: skips `sandbox_init()` entirely; useful when diagnosing whether an issue is sandbox-related
-- `--permissive`: uses `(allow default)` with targeted denies; useful for narrowing which rule is causing a problem
+Verbose output (`-v` / `RUST_LOG=debug`) goes to the same file. Users can tail it with `tail -f ~/.claude/ziplock.log`.
+
+### 6. Debug escape hatches were removed
+
+Early development included `--no-sandbox` (skip `sandbox_init` entirely) and `--permissive` (`(allow default)` with targeted denies) flags. These were removed before the first public release to avoid providing an easy bypass vector. Sandbox violations can be diagnosed with:
+
+```
+log stream --predicate 'subsystem == "com.apple.sandbox"'
+```
 
 ## Consequences
 
 - The write policy is home-directory-wide (minus ~/Library), which is broader than the original design intended
 - Mach IPC is fully open (`mach-lookup` etc. without service-name filters), which allows Claude Code to reach any Mach service, not just SecurityServer
-- The `CLAUDECODE` removal means ziplock can be used recursively (ziplock inside ziplock), though that scenario is not tested
+- Log output never reaches the terminal; users must check `~/.claude/ziplock.log` to see proxy/sandbox activity

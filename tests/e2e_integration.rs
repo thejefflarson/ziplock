@@ -22,18 +22,34 @@ unsafe extern "C" {
 
 /// Returns true if we're already running inside a sandbox (nested sandbox_init is forbidden).
 /// In that case the calling test should return early rather than fail.
+///
+/// Uses a fork-based probe to avoid applying a sandbox to the calling process as a side effect
+/// (sandbox_init is irreversible, so we must test it in a disposable child).
 fn already_sandboxed() -> bool {
-    // Attempt a trivial allow-all sandbox; if this fails we're already sandboxed.
-    let profile = c"(version 1)(allow default)";
-    let mut errorbuf: *mut c_char = std::ptr::null_mut();
-    let ret = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
-    if ret != 0 {
-        if !errorbuf.is_null() {
-            unsafe { sandbox_free_error(errorbuf) };
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
+
+    match unsafe { nix::unistd::fork() }.expect("fork failed") {
+        nix::unistd::ForkResult::Child => {
+            let profile = c"(version 1)(allow default)";
+            let mut errorbuf: *mut c_char = std::ptr::null_mut();
+            let ret = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
+            if ret != 0 {
+                if !errorbuf.is_null() {
+                    unsafe { sandbox_free_error(errorbuf) };
+                }
+                std::process::exit(1); // nested sandbox detected
+            }
+            std::process::exit(0); // not sandboxed
         }
-        return true;
+        nix::unistd::ForkResult::Parent { child } => {
+            use nix::sys::wait::WaitStatus;
+            match nix::sys::wait::waitpid(child, None).expect("waitpid failed") {
+                WaitStatus::Exited(_, 0) => false,
+                _ => true,
+            }
+        }
     }
-    false
 }
 
 fn apply_sandbox(profile: &str) -> Result<(), String> {
@@ -70,7 +86,7 @@ fn sandboxed_write_cwd_only() {
     let cwd = Path::new("/tmp/ziplock-e2e-write");
     std::fs::create_dir_all(cwd).ok();
 
-    let profile = ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true).unwrap();
+    let profile = ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None).unwrap();
 
     std::io::stdout().flush().ok();
     std::io::stderr().flush().ok();
@@ -121,7 +137,11 @@ fn sandboxed_write_cwd_only() {
 ///
 /// This is the key smoke test — if claude can't even print its version
 /// inside the sandbox, nothing else will work.
+///
+/// Requires running outside any sandbox environment (e.g., not via ziplock).
+/// Run with: `cargo test -- --ignored claude_version_runs_in_sandbox`
 #[test]
+#[ignore]
 fn claude_version_runs_in_sandbox() {
     if already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
@@ -140,7 +160,7 @@ fn claude_version_runs_in_sandbox() {
     std::fs::create_dir_all(cwd).ok();
 
     let profile =
-        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true).unwrap();
+        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None).unwrap();
 
     let profile_for_closure = profile.clone();
     let mut cmd = Command::new(&claude_path);
@@ -215,7 +235,7 @@ fn claude_responds_in_sandbox() {
 
     // Use allow_network=true so the API call can reach Anthropic
     let profile =
-        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true).unwrap();
+        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None).unwrap();
 
     let profile_for_closure = profile.clone();
     let mut cmd = Command::new(&claude_path);
@@ -295,6 +315,7 @@ fn sandboxed_read_permissions() {
         Path::new(&home),
         &[],
         true,
+        None,
     )
     .unwrap();
     std::fs::create_dir_all("/tmp/ziplock-e2e-reads").ok();
