@@ -42,7 +42,15 @@ pub fn generate_profile(
 
     let mut extra_write_rules = String::new();
     for path in allow_paths {
-        let safe = sanitize_sbpl_path(path)?;
+        // Canonicalize to resolve symlinks before interpolating into the SBPL profile.
+        // A symlink like /tmp/link -> ~/Library would otherwise bypass the ~/Library deny rule.
+        let canonical = std::fs::canonicalize(path).with_context(|| {
+            format!(
+                "--allow-path '{}' could not be canonicalized (does it exist?)",
+                path.display()
+            )
+        })?;
+        let safe = sanitize_sbpl_path(&canonical)?;
         extra_write_rules.push_str(&format!("    (subpath \"{safe}\")\n"));
     }
 
@@ -102,6 +110,7 @@ pub fn generate_profile(
     (subpath "/Library/Apple")
     (subpath "{home_str}/Library/Preferences")
     (subpath "{home_str}/Library/Caches")
+    (subpath "{home_str}/Library/Keychains")
 {ssh_agent_rule})
 
 ;; ── File writes ────────────────────────────────────────────────────────
@@ -236,6 +245,25 @@ pub fn spawn_claude(
             ),
         );
     }
+
+    // Ensure standard macOS paths are in PATH so subprocesses (shells spawned by Claude)
+    // can find tools like /usr/bin/head, /bin/mkdir, etc. Subprocess shells started
+    // non-interactively don't source /etc/profile, so they may inherit a stripped PATH.
+    let standard_paths = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin";
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = if current_path.is_empty() {
+        standard_paths.to_string()
+    } else {
+        // Append standard paths not already present
+        let mut parts: Vec<&str> = current_path.split(':').collect();
+        for p in standard_paths.split(':') {
+            if !parts.contains(&p) {
+                parts.push(p);
+            }
+        }
+        parts.join(":")
+    };
+    cmd.env("PATH", new_path);
 
     // Ensure /tmp/claude exists and set TMPDIR
     let tmp_claude = PathBuf::from("/tmp/claude");
@@ -377,16 +405,31 @@ mod tests {
 
     #[test]
     fn profile_extra_allow_paths() {
+        use std::fs;
+        // Use real temp dirs so canonicalize() succeeds.
+        let dir1 = std::env::temp_dir().join("ziplock_test_allow_a");
+        let dir2 = std::env::temp_dir().join("ziplock_test_allow_b");
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+        let canonical1 = fs::canonicalize(&dir1).unwrap();
+        let canonical2 = fs::canonicalize(&dir2).unwrap();
+
         let profile = generate_profile(
-            Path::new("/tmp/proj"),
+            Path::new("/tmp"),
             Path::new("/Users/test"),
-            &[PathBuf::from("/extra/path"), PathBuf::from("/another/path")],
+            &[dir1, dir2],
             false,
             None,
         )
         .unwrap();
-        assert!(profile.contains(r#"(subpath "/extra/path")"#));
-        assert!(profile.contains(r#"(subpath "/another/path")"#));
+        assert!(profile.contains(&format!(
+            r#"(subpath "{}")"#,
+            canonical1.display()
+        )));
+        assert!(profile.contains(&format!(
+            r#"(subpath "{}")"#,
+            canonical2.display()
+        )));
     }
 
     #[test]
