@@ -30,6 +30,7 @@ pub fn create_resolver() -> Result<Arc<TokioResolver>> {
     let mut opts = ResolverOpts::default();
     opts.use_hosts_file = ResolveHosts::Never;
     opts.num_concurrent_reqs = 2;
+    opts.timeout = std::time::Duration::from_secs(5);
 
     let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
         .with_options(opts)

@@ -83,6 +83,13 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<IpAddr, St
         return Err(format!("direct public IP connections blocked: {ip}"));
     }
 
+    // .local domains are mDNS (Bonjour) — Cloudflare DoH has no knowledge of them.
+    // Use the system resolver (getaddrinfo → mDNSResponder via Unix socket, which the
+    // sandbox allows via `network-outbound (remote unix-socket)`).
+    if host.ends_with(".local") {
+        return resolve_local_mdns(host).await;
+    }
+
     let response = resolver
         .lookup_ip(host)
         .await
@@ -101,6 +108,27 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<IpAddr, St
     }
 
     Err(format!("no addresses found for {host}"))
+}
+
+/// Resolve a `.local` mDNS hostname via the system resolver (mDNSResponder).
+/// The result must be a private IP — `.local` names should never resolve to public addresses.
+async fn resolve_local_mdns(host: &str) -> Result<IpAddr, String> {
+    let addrs = tokio::net::lookup_host(format!("{host}:0"))
+        .await
+        .map_err(|e| format!("mDNS lookup failed for {host}: {e}"))?;
+
+    let ip = addrs
+        .map(|sa| sa.ip())
+        .next()
+        .ok_or_else(|| format!("no addresses found for {host}"))?;
+
+    if !is_private_ip(&ip) {
+        return Err(format!(
+            ".local domain resolved to non-private IP (suspicious): {host} -> {ip}"
+        ));
+    }
+
+    Ok(ip)
 }
 
 // ── SOCKS5 (using fast-socks5 for protocol handling) ────────────────────────
@@ -417,6 +445,24 @@ mod tests {
         assert_eq!(
             parse_host_port("[::1]", 443).unwrap(),
             ("::1".to_string(), 443)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_mdns_resolves_via_system_resolver() {
+        // localhost.local isn't a real mDNS name, but we can verify the code path
+        // doesn't attempt DoH. The function should either resolve or return a DNS error —
+        // what it must NOT do is route through Cloudflare.
+        //
+        // We verify the routing by checking the function exists and compiles; actual
+        // mDNS resolution requires a live network with a .local device present.
+        let result = resolve_local_mdns("nonexistent-device-ziplock-test.local").await;
+        // Should fail with mDNS error, not a DoH error
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("mDNS lookup failed") || msg.contains("no addresses found"),
+            "unexpected error: {msg}"
         );
     }
 

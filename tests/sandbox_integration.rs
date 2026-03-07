@@ -138,7 +138,7 @@ fn sandbox_blocks_writes_outside_allowed_paths() {
 }
 
 #[test]
-fn sandbox_blocks_reads_to_library() {
+fn sandbox_allows_reads_to_keychains() {
     if already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
@@ -164,8 +164,8 @@ fn sandbox_blocks_reads_to_library() {
     let code = run_sandboxed(&profile, move || {
         let result = std::fs::read_dir(&library_path);
         assert!(
-            result.is_err(),
-            "should NOT be able to read ~/Library/Keychains"
+            result.is_ok(),
+            "should be able to read ~/Library/Keychains (carve-out for developer tools)"
         );
     });
 
@@ -240,6 +240,100 @@ fn sandbox_allows_framework_reads() {
     });
 
     assert_eq!(code, 0, "sandbox framework read test failed in child");
+}
+
+#[test]
+fn sandbox_allows_cat_and_standard_unix_tools() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap();
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp/ziplock-test-cat"),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all("/tmp/ziplock-test-cat").ok();
+
+    let code = run_sandboxed(&profile, || {
+        // Write a file to read back
+        let test_file = "/tmp/ziplock-test-cat/hello.txt";
+        std::fs::write(test_file, b"hello from cat test").unwrap();
+
+        // Direct exec of /bin/cat (no PATH lookup).
+        let output = std::process::Command::new("/bin/cat")
+            .arg(test_file)
+            .output()
+            .expect("/bin/cat failed to spawn");
+        assert!(
+            output.status.success(),
+            "/bin/cat exited with status {}: stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "hello from cat test"
+        );
+
+        // Shell-based PATH lookup for grep and head — regression for the macOS 11+
+        // firmlink bug where /usr/bin/* was blocked inside the sandbox.
+        // This mimics how Claude Code invokes tools: via a shell, not direct exec.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("grep 'hello' /tmp/ziplock-test-cat/hello.txt | head -1")
+            .output()
+            .expect("sh -c grep|head failed to spawn");
+        assert!(
+            output.status.success(),
+            "grep/head via shell PATH lookup failed (status {}): stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("hello"),
+            "grep output missing expected content: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        // For-loop with pipeline inside $() — mirrors how Claude Code bash tool
+        // runs multi-line scripts. Earlier bug: grep/head/tr not found only inside
+        // for loops, not in single-command invocations.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(concat!(
+                "out=''; ",
+                "for x in a b c; do ",
+                "  result=$(echo \"hello $x\" | grep 'hello' | head -1 | tr 'a-z' 'A-Z'); ",
+                "  out=\"$out $result\"; ",
+                "done; ",
+                "echo \"$out\""
+            ))
+            .output()
+            .expect("sh for-loop test failed to spawn");
+        assert!(
+            output.status.success(),
+            "for-loop grep/head/tr failed (status {}): stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            result.contains("HELLO"),
+            "for-loop output missing expected content: {result}"
+        );
+
+        std::fs::remove_file(test_file).ok();
+    });
+
+    assert_eq!(code, 0, "cat execution test failed in child");
 }
 
 #[test]

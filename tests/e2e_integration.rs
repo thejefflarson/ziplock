@@ -342,12 +342,12 @@ fn sandboxed_read_permissions() {
                 );
             }
 
-            // ~/Library/Keychains should be blocked
+            // ~/Library/Keychains should be readable (carve-out for developer tools like gh)
             let keychains = format!("{home_clone}/Library/Keychains");
             if Path::new(&keychains).exists() {
                 assert!(
-                    std::fs::read_dir(&keychains).is_err(),
-                    "should NOT be able to read ~/Library/Keychains"
+                    std::fs::read_dir(&keychains).is_ok(),
+                    "should be able to read ~/Library/Keychains"
                 );
             }
 

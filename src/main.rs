@@ -59,11 +59,14 @@ async fn run() -> Result<ExitCode> {
     if let Some(parent) = log_file_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file_path)
-        .context("failed to open log file")?;
+    // mode 0600: log contains accessed hostnames; must not be world-readable
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut log_opts = std::fs::OpenOptions::new();
+    log_opts.create(true).append(true);
+    #[cfg(unix)]
+    log_opts.mode(0o600);
+    let log_file = log_opts.open(&log_file_path).context("failed to open log file")?;
 
     let filter = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
@@ -99,7 +102,10 @@ async fn run() -> Result<ExitCode> {
         );
         (ports, Some(shutdown_tx))
     } else {
-        info!("DNS filtering disabled (--allow-network)");
+        warn!("--allow-network: DNS filtering disabled, full network access granted");
+        eprintln!(
+            "ziplock: WARNING: --allow-network disables DNS filtering; Claude has unrestricted network access"
+        );
         (proxy::ProxyPorts { socks5: 0, http: 0 }, None)
     };
 

@@ -20,7 +20,11 @@ fn sanitize_sbpl_path(path: &Path) -> Result<String> {
     // SBPL uses "..." string literals. A `"` in the path would terminate the literal
     // and allow injection of arbitrary sandbox rules. Reject any path containing
     // characters that are meaningful in SBPL syntax.
-    if s.contains('"') || s.contains('\\') {
+    // Reject characters that could break out of an SBPL string literal or
+    // corrupt the profile: `"` terminates the literal, `\` is the escape
+    // character, and control characters (including \n, \r) may cause
+    // unpredictable parser behaviour or allow rule injection.
+    if s.contains('"') || s.contains('\\') || s.chars().any(|c| c.is_control()) {
         anyhow::bail!(
             "path contains characters unsafe for sandbox profile: {}",
             path.display()
@@ -83,7 +87,11 @@ pub fn generate_profile(
 (deny default)
 
 ;; ── Process ──────────────────────────────────────────────────────────────
-(allow process-exec*)
+;; process-exec* wildcard is silently ignored in SBPL (same trap as mach*).
+;; Enumerate ops explicitly: process-exec-interpreter is required for hashbang
+;; scripts (e.g. npm lifecycle hooks that invoke #!/usr/bin/env node scripts).
+(allow process-exec)
+(allow process-exec-interpreter)
 (allow process-fork)
 (allow process-info*)
 (allow signal (target same-sandbox))
@@ -113,6 +121,22 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Keychains")
 {ssh_agent_rule})
 
+;; On macOS 11+, /bin, /usr, and /sbin are firmlinks into /System/Volumes/Root.
+;; The kernel resolves firmlinks before evaluating sandbox subpath rules, so the
+;; (deny file-read* (subpath "/System")) rule above blocks /bin/cat, /usr/bin/grep,
+;; etc. Re-allow these standard Unix paths explicitly (last-match-wins in SBPL).
+(allow file-read* process-exec
+    (subpath "/bin")
+    (subpath "/usr/bin")
+    (subpath "/usr/lib")
+    (subpath "/usr/libexec")
+    (subpath "/usr/share")
+    (subpath "/sbin")
+    (subpath "/usr/sbin")
+    ;; Homebrew: /opt/homebrew on Apple Silicon, /usr/local on Intel
+    (subpath "/opt/homebrew")
+    (subpath "/usr/local"))
+
 ;; ── File writes ────────────────────────────────────────────────────────
 ;; Allow writes to home dir broadly (excluding sensitive ~/Library subtree)
 ;; then restrict further to only allowed paths
@@ -130,6 +154,9 @@ pub fn generate_profile(
 ;; Re-allow caches (build tools: Go, npm, pip, Homebrew, etc.)
 (allow file-write*
     (subpath "{home_str}/Library/Caches"))
+;; Re-allow keychain writes (OAuth token storage for Claude Code login)
+(allow file-write*
+    (subpath "{home_str}/Library/Keychains"))
 
 ;; ── Network ──────────────────────────────────────────────────────────────
 {network_rules}
@@ -422,14 +449,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(profile.contains(&format!(
-            r#"(subpath "{}")"#,
-            canonical1.display()
-        )));
-        assert!(profile.contains(&format!(
-            r#"(subpath "{}")"#,
-            canonical2.display()
-        )));
+        assert!(profile.contains(&format!(r#"(subpath "{}")"#, canonical1.display())));
+        assert!(profile.contains(&format!(r#"(subpath "{}")"#, canonical2.display())));
     }
 
     #[test]
@@ -444,6 +465,28 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn profile_rejects_path_with_control_chars() {
+        // A newline embedded in a path could inject SBPL rules after the string literal
+        let result = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[PathBuf::from("/tmp/evil\n)(allow network-outbound")],
+            false,
+            None,
+        );
+        assert!(result.is_err(), "path with embedded newline should be rejected");
+
+        let result2 = generate_profile(
+            Path::new("/tmp/proj\r(allow network-outbound)"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        );
+        assert!(result2.is_err(), "cwd with embedded CR should be rejected");
     }
 
     #[test]
@@ -493,6 +536,55 @@ mod tests {
             ),
             "SSH agent dir should appear as a file-read carve-out"
         );
+    }
+
+    #[test]
+    fn profile_allows_standard_unix_paths_after_system_deny() {
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        // /bin, /usr/bin, etc. are firmlinks into /System/Volumes/Root on macOS 11+.
+        // They must be explicitly re-allowed after the (deny file-read* (subpath "/System")) rule.
+        let deny_system_pos = profile.find(r#"(subpath "/System")"#).unwrap();
+        for path in &[
+            "/bin",
+            "/usr/bin",
+            "/usr/lib",
+            "/usr/libexec",
+            "/usr/share",
+            "/sbin",
+            "/usr/sbin",
+        ] {
+            let rule = format!(r#"(subpath "{path}")"#);
+            let allow_pos = profile
+                .rfind(&rule)
+                .expect(&format!("{rule} missing from profile"));
+            assert!(
+                allow_pos > deny_system_pos,
+                "{rule} carve-out must appear after (deny file-read* (subpath \"/System\"))"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_allows_homebrew_exec() {
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        // npm lifecycle scripts spawn binaries from Homebrew; both paths must be
+        // allowed for process-exec so node, npm, python, etc. can be spawned.
+        assert!(profile.contains(r#"(subpath "/opt/homebrew")"#));
+        assert!(profile.contains(r#"(subpath "/usr/local")"#));
     }
 
     #[test]

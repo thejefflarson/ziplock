@@ -42,6 +42,8 @@ The DoH connection is made from ziplock's own (unsandboxed) process — the sand
 
 **Root certificates:** The `webpki-roots` feature is also enabled, which provides hickory's rustls TLS stack with Mozilla's bundled root CA set. Without it, rustls has no trust anchors and rejects all server certificates (`UnknownIssuer`). `webpki-roots` is preferred over `rustls-platform-verifier` (macOS Security framework) because it avoids any dependency on system APIs and is unaffected by enterprise MITM certificates that may be installed in the system trust store.
 
+**Resolver timeout:** `ResolverOpts::timeout` is set explicitly to 5 seconds (matching hickory's internal default, but made explicit so the value is visible and intentional). If Cloudflare is unreachable, DNS resolution fails after 5 s, all non-localhost connections are denied, and Claude cannot reach the internet — a safe-fail outcome.
+
 ### 1Password SSH Agent
 
 Scan `~/Library/Group Containers/` at startup for any directory whose name contains `1password` or `agilebits`, then check for `t/agent.sock` within it. If found:

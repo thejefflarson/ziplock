@@ -17,7 +17,7 @@ ziplock
        └─ all network forced through localhost proxy
 ```
 
-**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, except `~/Library/Caches`). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library` (keychains, cookies, browser data), `/Library`, and `/System` are blocked, with carve-outs for `~/Library/Caches` and `~/Library/Preferences`. Productivity credentials (`~/.ssh`, `~/.aws`) remain accessible.
+**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, except `~/Library/Caches`). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for `~/Library/Caches`, `~/Library/Preferences`, and `~/Library/Keychains` (required for developer tools like `gh` that read tokens via the macOS Keychain API). Productivity credentials (`~/.ssh`, `~/.aws`) remain accessible. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule.
 
 **Layer 2 — DNS-Filtering Proxy:** SOCKS5 + HTTP CONNECT proxies resolve all DNS via DNS-over-HTTPS (DoH) to Cloudflare 1.1.1.3, which blocks known malware and adult content domains. DoH encrypts queries end-to-end, preventing interception. The sandbox forces all traffic through localhost — no bypass possible. Direct connections to public IPs are also blocked.
 
@@ -51,12 +51,77 @@ ziplock -v
 | Attack | Mitigation |
 |--------|------------|
 | Write to system or sensitive home paths (`rm -rf /`, modify `~/Library`) | Sandbox blocks writes outside CWD/tmp/$HOME and to ~/Library |
-| Read keychains, cookies, browser data | Sandbox blocks reads to ~/Library, /Library, /System |
+| Read cookies, browser data, app secrets | Sandbox blocks reads to ~/Library, /Library, /System (keychains readable for developer tools) |
 | Download malware | Cloudflare 1.1.1.3 blocks known malware domains |
 | Connect to C2/phishing sites | DNS filter blocks categorized threats |
 | Bypass DNS via direct IP | Proxy blocks all public IP connections |
 | Bypass proxy entirely | Sandbox blocks all non-localhost network |
 | Escape sandbox via child process | Sandbox inherited by all children, cannot be removed |
+
+## Threat model
+
+Ziplock is effective against **untargeted, opportunistic attacks** — the prompt-injection-downloads-malware class of threat. It provides meaningful friction against **targeted data exfiltration** via novel domains or raw IPs. It provides **no protection** against an adversary who uses allowed domains as exfil channels or who specifically targets in-scope credentials like `~/.ssh` private keys.
+
+### Attacker model
+
+The adversary is **malicious content in Claude's context** — a prompt injection in a file Claude reads, a hostile webpage it fetches, or a compromised tool response. The adversary controls what Claude *does*, not what runs on the machine before ziplock starts. The user is trusted; ziplock protects the user from Claude, not Claude from the user.
+
+### What ziplock blocks
+
+#### Filesystem
+
+| Attack | Blocked by |
+|---|---|
+| Overwrite system files (`/etc`, `/bin`, `/usr`) | Seatbelt `file-write*` deny default |
+| Corrupt other users' home dirs | Seatbelt write restricted to `$HOME` |
+| Modify `~/Library` (cookies, app state, Mail) | Explicit `file-write*` deny on `~/Library` |
+| Modify keychains / insert rogue credential | Writes to `~/Library/Keychains` blocked |
+| Persist malware in `~/Library/LaunchAgents` | Covered by `~/Library` write deny |
+| Escape CWD via `--allow-path` symlink | Paths canonicalized before SBPL insertion |
+| SBPL injection via crafted path argument | `"` and `\` rejected; null bytes caught by `CString` |
+
+#### Network
+
+| Attack | Blocked by |
+|---|---|
+| Download/execute malware from known C2 domain | Cloudflare 1.1.1.3 returns `0.0.0.0` |
+| Connect to known phishing/malware IP via domain | DNS filter |
+| Bypass DNS filter via raw public IP | Proxy rejects non-private literal IPs |
+| Bypass proxy entirely (direct outbound TCP) | Sandbox restricts network to `localhost:*` |
+| Intercept or spoof DNS queries | All DNS over DoH (TLS to `family.cloudflare-dns.com`) |
+| DNS rebinding (domain → private IP after allow) | Resolved IP checked against `is_private_ip()` |
+
+#### Process
+
+| Attack | Blocked by |
+|---|---|
+| Spawn unsandboxed child process | Sandbox inherited across `exec` |
+| Remove sandbox from a child process | Seatbelt cannot be removed once applied |
+| Signal arbitrary other processes | `signal` restricted to `target same-sandbox` |
+
+### What ziplock does not block
+
+#### Accepted trade-offs
+
+| Attack | Why not blocked |
+|---|---|
+| Read `~/Library/Keychains` (enumerate credential names) | Deliberate carve-out — required for `gh` and other developer tools |
+| Read `~/.ssh` private keys | `~/.ssh` is under `$HOME`, which must be readable for Claude to work |
+| Connect to Docker/Podman/OrbStack socket and issue daemon API calls | Unix domain sockets are broadly allowed (required for mDNS, 1Password, and other IPC). Blocking specific container runtime sockets is impractical as new runtimes add new socket paths. **If you run Docker, Claude can call the Docker API.** |
+| Read `~/.aws`, `~/.config`, `.env`, etc. | Same — Claude needs project file access; no way to distinguish |
+| Exfiltrate to an *uncategorized* domain | DNS filter is Cloudflare's categorization list, not a whitelist |
+| Exfiltrate via allowed domains (`github.com`, `pastebin.com`) | Legitimate domains are unblocked by design |
+| Write anywhere in `$HOME` outside `~/Library` | Required for LSP plugins and build tools at startup |
+
+#### The keychain nuance
+
+Reading a keychain item's *value* requires calling `SecItemCopyMatching`, which communicates with `com.apple.SecurityServer` via Mach IPC. The sandbox allows `mach-lookup` broadly (required for Claude Code itself), so this call succeeds. **Ziplock does not prevent Claude from reading keychain secret values** — only from writing to the keychain database files. Users who need stronger credential isolation should not run tools that require keychain auth within Claude's scope.
+
+#### DNS filter limitations
+
+- **Uncategorized domains:** A freshly registered exfiltration domain that Cloudflare hasn't categorized will resolve normally.
+- **Steganographic exfiltration:** Data encoded in DNS query names (`data.attacker.com`) passes through to Cloudflare; query content is not inspected.
+- **Allowed domains as exfil channels:** Claude can POST to `github.com`, `pastebin.com`, etc. — all legitimate, all unblocked.
 
 ## Comparison
 
