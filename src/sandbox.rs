@@ -566,7 +566,7 @@ mod tests {
             let rule = format!(r#"(subpath "{path}")"#);
             let allow_pos = profile
                 .rfind(&rule)
-                .expect(&format!("{rule} missing from profile"));
+                .unwrap_or_else(|| panic!("{rule} missing from profile"));
             assert!(
                 allow_pos > deny_system_pos,
                 "{rule} carve-out must appear after (deny file-read* (subpath \"/System\"))"
