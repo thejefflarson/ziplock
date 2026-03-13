@@ -66,7 +66,9 @@ async fn run() -> Result<ExitCode> {
     log_opts.create(true).append(true);
     #[cfg(unix)]
     log_opts.mode(0o600);
-    let log_file = log_opts.open(&log_file_path).context("failed to open log file")?;
+    let log_file = log_opts
+        .open(&log_file_path)
+        .context("failed to open log file")?;
 
     let filter = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()

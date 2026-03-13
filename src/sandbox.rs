@@ -477,7 +477,10 @@ mod tests {
             false,
             None,
         );
-        assert!(result.is_err(), "path with embedded newline should be rejected");
+        assert!(
+            result.is_err(),
+            "path with embedded newline should be rejected"
+        );
 
         let result2 = generate_profile(
             Path::new("/tmp/proj\r(allow network-outbound)"),
