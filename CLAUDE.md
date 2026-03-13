@@ -50,13 +50,17 @@ src/
 ## Testing
 
 ```bash
-cargo test                        # unit + integration (safe to run anywhere)
-cargo test -- --ignored           # also run tests that require outbound network / no sandbox
+cargo test -- --test-threads=1    # unit + integration (fork tests need single-threaded runner)
+cargo test -- --test-threads=1 --ignored   # also run tests requiring outbound network / no sandbox
 cargo test --test e2e_integration -- --ignored claude_version_runs_in_sandbox
 ```
 
+> **Note:** Always pass `--test-threads=1`. The sandbox integration tests use `fork()` internally;
+> running them in parallel threads causes intermittent deadlocks (fork + mutex contention).
+
 Tests marked `#[ignore]`:
 - `claude_version_runs_in_sandbox` / `claude_responds_in_sandbox` — require running outside any sandbox
+- `sandbox_allows_cat_and_standard_unix_tools` — spawns grandchild processes; deadlocks when run inside ziplock's own sandbox (where `already_sandboxed()` falsely returns false)
 - `socks5::resolves_real_domain` — requires outbound DNS to Cloudflare
 
 ## Architecture Decision Records
