@@ -185,12 +185,12 @@ pub fn generate_profile(
 (allow system-socket)
 (allow lsopen)
 (allow darwin-notification-post)
-;; process-info* is required by ps, top, htop, and similar monitoring tools to
-;; query process state from the kernel via proc_pidinfo(). Without it those
-;; tools silently return no data or exit with EPERM.
+;; process-info* allows proc_pidinfo() calls used by monitoring tools and Node.js
+;; APIs (process.cpuUsage(), os.loadavg()). Note: /bin/ps and /usr/bin/top are
+;; setuid-root binaries — the macOS sandbox blocks setuid execution unconditionally,
+;; so those specific tools will not work inside any sandbox regardless of this rule.
 ;; Valid ops: process-info-pidinfo, process-info-pidfdinfo, process-info-listpids,
 ;; process-info-setcontrol, process-info-dirtycontrol, process-info-codesignature.
-;; The wildcard process-info* covers all of them (empirically verified).
 (allow process-info*)
 
 ;; ── Device and FD operations ─────────────────────────────────────────────
@@ -513,8 +513,12 @@ mod tests {
 
     #[test]
     fn profile_allows_process_info_for_monitoring_tools() {
-        // ps, top, htop call proc_pidinfo() which requires process-info* SBPL ops.
-        // The correct prefix is "process-info" (not "proc-info" which is unbound).
+        // process-info* permits proc_pidinfo() calls (used by ps, top, htop).
+        // Note: /bin/ps and /usr/bin/top are setuid-root binaries; the macOS sandbox
+        // blocks execution of setuid binaries unconditionally regardless of the SBPL
+        // profile. process-info* still benefits non-setuid tools and Node.js APIs
+        // that call proc_pidinfo() directly (e.g. os.loadavg(), process.cpuUsage()).
+        // The correct prefix is "process-info" — "proc-info" is an unbound SBPL variable.
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
