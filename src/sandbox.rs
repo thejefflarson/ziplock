@@ -185,6 +185,13 @@ pub fn generate_profile(
 (allow system-socket)
 (allow lsopen)
 (allow darwin-notification-post)
+;; process-info* is required by ps, top, htop, and similar monitoring tools to
+;; query process state from the kernel via proc_pidinfo(). Without it those
+;; tools silently return no data or exit with EPERM.
+;; Valid ops: process-info-pidinfo, process-info-pidfdinfo, process-info-listpids,
+;; process-info-setcontrol, process-info-dirtycontrol, process-info-codesignature.
+;; The wildcard process-info* covers all of them (empirically verified).
+(allow process-info*)
 
 ;; ── Device and FD operations ─────────────────────────────────────────────
 (allow file-read* file-write*
@@ -502,6 +509,24 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn profile_allows_process_info_for_monitoring_tools() {
+        // ps, top, htop call proc_pidinfo() which requires process-info* SBPL ops.
+        // The correct prefix is "process-info" (not "proc-info" which is unbound).
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains("(allow process-info*)"),
+            "profile must contain (allow process-info*) for ps/top/htop support"
+        );
     }
 
     #[test]
