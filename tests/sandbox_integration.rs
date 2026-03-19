@@ -242,6 +242,54 @@ fn sandbox_allows_framework_reads() {
     assert_eq!(code, 0, "sandbox framework read test failed in child");
 }
 
+#[test]
+fn sandbox_allows_reads_to_system_preferences() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    // /Library/Preferences is where xcodebuild stores its accepted-license state.
+    // If this directory isn't readable, xcodebuild will always prompt for license
+    // acceptance even after `sudo xcodebuild -license accept` has been run.
+    let pref_path = "/Library/Preferences";
+    if !Path::new(pref_path).exists() {
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp/ziplock-test-sysprefs"),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all("/tmp/ziplock-test-sysprefs").ok();
+
+    let code = run_sandboxed(&profile, move || {
+        let result = std::fs::read_dir(pref_path);
+        assert!(
+            result.is_ok(),
+            "should be able to read /Library/Preferences (needed for xcodebuild license): {:?}",
+            result.err()
+        );
+        // Specifically verify the Xcode plist is accessible if present
+        let xcode_plist = "/Library/Preferences/com.apple.dt.Xcode.plist";
+        if Path::new(xcode_plist).exists() {
+            let result = std::fs::metadata(xcode_plist);
+            assert!(
+                result.is_ok(),
+                "should be able to read com.apple.dt.Xcode.plist: {:?}",
+                result.err()
+            );
+        }
+    });
+
+    assert_eq!(code, 0, "sandbox system preferences read test failed in child");
+}
+
 // Spawning grandchild processes (cat, sh) inside a doubly-sandboxed process
 // (ziplock's own sandbox + the test's sandbox) causes a deadlock because
 // already_sandboxed() falsely returns false inside ziplock. Run manually:
