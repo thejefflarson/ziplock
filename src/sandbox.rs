@@ -121,6 +121,7 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Caches")
     (subpath "{home_str}/Library/Keychains")
     (subpath "{home_str}/Library/Developer")
+    (subpath "{home_str}/Library/org.swift.swiftpm")
 {ssh_agent_rule})
 
 ;; On macOS 11+, /bin, /usr, and /sbin are firmlinks into /System/Volumes/Root.
@@ -162,6 +163,9 @@ pub fn generate_profile(
 ;; Re-allow ~/Library/Developer (xcodebuild DerivedData, CoreSimulator, archives)
 (allow file-write*
     (subpath "{home_str}/Library/Developer"))
+;; Re-allow ~/Library/org.swift.swiftpm (Swift Package Manager cache and security)
+(allow file-write*
+    (subpath "{home_str}/Library/org.swift.swiftpm"))
 
 ;; ── Network ──────────────────────────────────────────────────────────────
 {network_rules}
