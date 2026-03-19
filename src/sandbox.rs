@@ -120,6 +120,7 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Preferences")
     (subpath "{home_str}/Library/Caches")
     (subpath "{home_str}/Library/Keychains")
+    (subpath "{home_str}/Library/Developer")
 {ssh_agent_rule})
 
 ;; On macOS 11+, /bin, /usr, and /sbin are firmlinks into /System/Volumes/Root.
@@ -158,6 +159,9 @@ pub fn generate_profile(
 ;; Re-allow keychain writes (OAuth token storage for Claude Code login)
 (allow file-write*
     (subpath "{home_str}/Library/Keychains"))
+;; Re-allow ~/Library/Developer (xcodebuild DerivedData, CoreSimulator, archives)
+(allow file-write*
+    (subpath "{home_str}/Library/Developer"))
 
 ;; ── Network ──────────────────────────────────────────────────────────────
 {network_rules}

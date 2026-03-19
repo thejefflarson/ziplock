@@ -243,6 +243,54 @@ fn sandbox_allows_framework_reads() {
 }
 
 #[test]
+fn sandbox_allows_xcode_developer_dir() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap();
+    let dev_dir = format!("{home}/Library/Developer");
+    if !Path::new(&dev_dir).exists() {
+        return;
+    }
+
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp/ziplock-test-xcode"),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all("/tmp/ziplock-test-xcode").ok();
+
+    let code = run_sandboxed(&profile, move || {
+        // Read: Xcode schemes, device support files, CoreSimulator runtimes
+        let result = std::fs::read_dir(&dev_dir);
+        assert!(
+            result.is_ok(),
+            "should be able to read ~/Library/Developer: {:?}",
+            result.err()
+        );
+
+        // Write: DerivedData (xcodebuild build output)
+        let derived_data = format!("{dev_dir}/Xcode/DerivedData");
+        std::fs::create_dir_all(&derived_data).ok();
+        let test_file = format!("{derived_data}/.ziplock-write-test");
+        let write_result = std::fs::write(&test_file, b"ok");
+        assert!(
+            write_result.is_ok(),
+            "should be able to write to ~/Library/Developer/Xcode/DerivedData: {:?}",
+            write_result.err()
+        );
+        std::fs::remove_file(&test_file).ok();
+    });
+
+    assert_eq!(code, 0, "xcode developer dir test failed in child");
+}
+
+#[test]
 fn sandbox_allows_reads_to_system_preferences() {
     if already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
