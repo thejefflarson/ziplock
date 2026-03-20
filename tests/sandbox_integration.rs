@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
     fn sandbox_free_error(errorbuf: *mut c_char);
+    // SANDBOX_FILTER_PATH=3, SANDBOX_CHECK_NO_REPORT=4; vararg is const char* path
+    fn sandbox_check(pid: nix::libc::pid_t, operation: *const c_char, op_type: c_int, ...) -> c_int;
 }
 
 /// Returns true if we're already running inside a sandbox (nested sandbox_init is forbidden).
@@ -640,4 +642,327 @@ fn sandbox_extra_allow_path() {
     });
 
     assert_eq!(code, 0, "sandbox extra allow-path test failed in child");
+}
+
+// Spawning grandchild processes inside a doubly-sandboxed process (ziplock's own
+// sandbox + the test's sandbox) causes a deadlock because already_sandboxed()
+// falsely returns false inside ziplock. Run these manually with --ignored.
+
+// Spawning grandchild processes (codesign) inside a doubly-sandboxed process
+// (ziplock's own sandbox + the test's sandbox) causes a deadlock because
+// already_sandboxed() falsely returns false inside ziplock. Run manually:
+//   cargo test -- --ignored sandbox_allows_codesign_ad_hoc
+#[test]
+#[ignore]
+fn sandbox_allows_codesign_ad_hoc() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    // codesign --sign - (ad-hoc signing) calls sandbox_check() against
+    // ~/Library/Security and /Library/Security (trust settings) before signing.
+    // Without read carve-outs for those paths, sandbox_check() returns EPERM
+    // and codesign exits "Operation not permitted" without logging any violation.
+    let home = std::env::var("HOME").unwrap();
+    let test_dir = "/tmp/ziplock-test-codesign";
+    std::fs::create_dir_all(test_dir).ok();
+
+    // Copy a real Mach-O binary into the test dir so we have something to sign.
+    let target_binary = format!("{test_dir}/test-binary");
+    std::fs::copy("/bin/ls", &target_binary).expect("failed to copy /bin/ls for codesign test");
+
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new(test_dir),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    let code = run_sandboxed(&profile, move || {
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none", "--generate-entitlement-der", &target_binary])
+            .output()
+            .expect("failed to spawn codesign");
+        assert!(
+            output.status.success(),
+            "codesign --sign - failed (status {}): stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+
+    std::fs::remove_file(format!("{test_dir}/test-binary")).ok();
+    assert_eq!(code, 0, "codesign ad-hoc signing test failed in child");
+}
+
+// Full xcodebuild framework build inside the sandbox. Uses xcodegen to generate
+// the .xcodeproj from a project.yml so we don't have to hand-craft pbxproj.
+// Exercises: xcodegen, Swift compilation, codesign, builtin-copy,
+// builtin-RegisterExecutionPolicyException, DerivedData writes.
+// Requires xcodegen on PATH (`brew install xcodegen`).
+// Run manually: cargo test -- --ignored sandbox_allows_xcodebuild_framework_build
+#[test]
+#[ignore]
+fn sandbox_allows_xcodebuild_framework_build() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    if which::which("xcodegen").is_err() {
+        eprintln!("skipping: xcodegen not found on PATH (brew install xcodegen)");
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    let test_dir = "/tmp/ziplock-test-xcodebuild";
+    std::fs::create_dir_all(test_dir).ok();
+
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new(test_dir),
+        Path::new(&home),
+        &[],
+        true, // allow_network: skip DNS proxy so xcodebuild can reach Apple CDN if needed
+        None,
+    )
+    .unwrap();
+
+    let code = run_sandboxed(&profile, move || {
+        // Write project.yml
+        std::fs::write(
+            format!("{test_dir}/project.yml"),
+            "name: ZiplockTestApp\n\
+             packages:\n\
+             \x20 SwiftTerm:\n\
+             \x20\x20\x20 url: https://github.com/migueldeicaza/SwiftTerm.git\n\
+             \x20\x20\x20 branch: main\n\
+             targets:\n\
+             \x20 ZiplockTestApp:\n\
+             \x20\x20\x20 type: application\n\
+             \x20\x20\x20 platform: macOS\n\
+             \x20\x20\x20 deploymentTarget: \"14.0\"\n\
+             \x20\x20\x20 sources:\n\
+             \x20\x20\x20\x20\x20 - Sources\n\
+             \x20\x20\x20 dependencies:\n\
+             \x20\x20\x20\x20\x20 - package: SwiftTerm\n\
+             \x20\x20\x20 settings:\n\
+             \x20\x20\x20\x20\x20 GENERATE_INFOPLIST_FILE: YES\n\
+             \x20\x20\x20\x20\x20 CODE_SIGN_IDENTITY: \"-\"\n\
+             \x20\x20\x20\x20\x20 CODE_SIGN_STYLE: Manual\n\
+             \x20\x20\x20\x20\x20 ENABLE_HARDENED_RUNTIME: NO\n",
+        )
+        .expect("failed to write project.yml");
+
+        // Write a minimal Swift app that imports SwiftTerm to force linking
+        std::fs::create_dir_all(format!("{test_dir}/Sources")).ok();
+        std::fs::write(
+            format!("{test_dir}/Sources/main.swift"),
+            "import Foundation\nimport SwiftTerm\n",
+        )
+        .expect("failed to write Swift source");
+
+        // Generate the .xcodeproj
+        let out = std::process::Command::new("xcodegen")
+            .args(["generate", "--spec", &format!("{test_dir}/project.yml"), "--project", test_dir])
+            .current_dir(test_dir)
+            .output()
+            .expect("failed to spawn xcodegen");
+        assert!(
+            out.status.success(),
+            "xcodegen failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Build — redirect DerivedData into the test dir so cleanup is easy.
+        // sandbox-exec (used by SPM for swiftc manifest compilation and by xcodebuild
+        // for build steps) calls sandbox_apply() which is blocked inside ziplock's SBPL
+        // profile. No valid SBPL op name allows it selectively, so disable SPM's own
+        // sandboxing via env vars and -IDEPackageSupportDisableManifestSandbox=YES.
+        let derived_data = format!("{test_dir}/DerivedData");
+        let out = std::process::Command::new("xcodebuild")
+            .env("SWIFTPM_SANDBOX", "0")
+            .env("XBS_DISABLE_SANDBOXED_BUILDS", "1")
+            .args([
+                "build",
+                "-project", &format!("{test_dir}/ZiplockTestApp.xcodeproj"),
+                "-scheme", "ZiplockTestApp",
+                "-configuration", "Debug",
+                "-derivedDataPath", &derived_data,
+                "-IDEPackageSupportDisableManifestSandbox=YES",
+            ])
+            .current_dir(test_dir)
+            .output()
+            .expect("failed to spawn xcodebuild");
+        assert!(
+            out.status.success(),
+            "xcodebuild failed ({}): stdout={} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+
+    assert_eq!(code, 0, "xcodebuild app build test failed in child");
+    std::fs::remove_dir_all(test_dir).ok();
+}
+
+// Diagnostic: call sandbox_check() directly for every file operation on both
+// /tmp (known-good) and ~/Library/Developer (failing) to identify the denied op.
+// Verify that codesign can sign files in ~/Library/* subdirectories inside the sandbox.
+// codesign (via AMFI) calls sandbox_check() on each ancestor directory before signing.
+// ~/Library itself needs both file-read* and file-write* ALLOW (via literal carve-out)
+// even though its contents are protected. Run manually:
+//   cargo test -- --test-threads=1 --ignored sandbox_allows_codesign_in_library
+#[test]
+#[ignore]
+fn sandbox_allows_codesign_in_library() {
+    if already_sandboxed() { return; }
+    let home = std::env::var("HOME").unwrap();
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp"),
+        Path::new(&home), &[], true, None,
+    ).unwrap();
+
+    let code = run_sandboxed(&profile, move || {
+        let home = std::env::var("HOME").unwrap();
+
+        // Verify ~/Library itself is ALLOW inside the sandbox
+        let check_r = {
+            let op   = CString::new("file-read-data").unwrap();
+            let path = CString::new(format!("{home}/Library")).unwrap();
+            unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 1, path.as_ptr()) }
+        };
+        let check_w = {
+            let op   = CString::new("file-write-data").unwrap();
+            let path = CString::new(format!("{home}/Library")).unwrap();
+            unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 1, path.as_ptr()) }
+        };
+        assert_eq!(check_r, 0, "file-read-data on ~/Library must be ALLOW (codesign ancestor check)");
+        assert_eq!(check_w, 0, "file-write-data on ~/Library must be ALLOW (codesign ancestor check)");
+
+        // codesign must work on files under ~/Library/Developer
+        let dev_file = format!("{home}/Library/Developer/Xcode/DerivedData/ziplock-cs-library-test");
+        std::fs::copy("/bin/ls", &dev_file).expect("copy binary to DerivedData");
+        let out = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none", &dev_file])
+            .output().expect("spawn codesign");
+        std::fs::remove_file(&dev_file).ok();
+        assert!(out.status.success(),
+            "codesign in ~/Library/Developer failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim());
+
+        // Also verify ~/Library/Caches (another carve-out subdirectory)
+        let caches_file = format!("{home}/Library/Caches/ziplock-cs-library-test");
+        std::fs::copy("/bin/ls", &caches_file).expect("copy binary to Caches");
+        let out = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none", &caches_file])
+            .output().expect("spawn codesign caches");
+        std::fs::remove_file(&caches_file).ok();
+        assert!(out.status.success(),
+            "codesign in ~/Library/Caches failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim());
+    });
+    assert_eq!(code, 0, "sandbox_allows_codesign_in_library failed in sandbox");
+}
+
+// End-to-end xcodebuild test using the default DerivedData location
+// (~/Library/Developer/Xcode/DerivedData). This is the key test for the
+// ~/Library literal carve-out: xcodebuild writes to DerivedData and codesign
+// signs the resulting binary there — both require the ancestor-directory
+// sandbox_check() on ~/Library to pass.
+//
+// Uses xcodegen to generate a minimal no-dependency Swift app. No network needed.
+// Run manually: cargo test -- --test-threads=1 --ignored sandbox_allows_xcodebuild_deriveddata
+#[test]
+#[ignore]
+fn sandbox_allows_xcodebuild_deriveddata() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    if which::which("xcodegen").is_err() {
+        eprintln!("skipping: xcodegen not found on PATH (brew install xcodegen)");
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    let test_dir = "/tmp/ziplock-test-deriveddata";
+    let derived_data = format!("{home}/Library/Developer/Xcode/DerivedData/ziplock-test-deriveddata");
+    std::fs::create_dir_all(test_dir).ok();
+
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new(test_dir),
+        Path::new(&home),
+        &[],
+        true, // allow_network: skip DNS proxy; test is offline but xcodebuild needs Apple CDN for toolchain metadata
+        None,
+    )
+    .unwrap();
+
+    let derived_data_inner = derived_data.clone();
+    let code = run_sandboxed(&profile, move || {
+        let derived_data = &derived_data_inner;
+        // Minimal Swift app — no SPM dependencies, no network required
+        std::fs::write(
+            format!("{test_dir}/project.yml"),
+            "name: ZiplockMinBuild\n\
+             targets:\n\
+             \x20 ZiplockMinBuild:\n\
+             \x20\x20\x20 type: application\n\
+             \x20\x20\x20 platform: macOS\n\
+             \x20\x20\x20 deploymentTarget: \"14.0\"\n\
+             \x20\x20\x20 sources:\n\
+             \x20\x20\x20\x20\x20 - Sources\n\
+             \x20\x20\x20 settings:\n\
+             \x20\x20\x20\x20\x20 GENERATE_INFOPLIST_FILE: YES\n\
+             \x20\x20\x20\x20\x20 CODE_SIGN_IDENTITY: \"-\"\n\
+             \x20\x20\x20\x20\x20 CODE_SIGN_STYLE: Manual\n\
+             \x20\x20\x20\x20\x20 ENABLE_HARDENED_RUNTIME: NO\n",
+        )
+        .expect("write project.yml");
+
+        std::fs::create_dir_all(format!("{test_dir}/Sources")).ok();
+        std::fs::write(
+            format!("{test_dir}/Sources/main.swift"),
+            "print(\"ziplock sandbox test\")\n",
+        )
+        .expect("write main.swift");
+
+        let out = std::process::Command::new("xcodegen")
+            .args(["generate", "--spec", &format!("{test_dir}/project.yml"), "--project", test_dir])
+            .current_dir(test_dir)
+            .output()
+            .expect("spawn xcodegen");
+        assert!(out.status.success(), "xcodegen failed: {}", String::from_utf8_lossy(&out.stderr));
+
+        // Build with DerivedData in ~/Library/Developer — exercises the ~/Library
+        // literal carve-out: codesign checks file-read/write-data on ~/Library itself.
+        let out = std::process::Command::new("xcodebuild")
+            .env("SWIFTPM_SANDBOX", "0")
+            .env("XBS_DISABLE_SANDBOXED_BUILDS", "1")
+            .args([
+                "build",
+                "-project", &format!("{test_dir}/ZiplockMinBuild.xcodeproj"),
+                "-scheme", "ZiplockMinBuild",
+                "-configuration", "Debug",
+                "-derivedDataPath", &derived_data,
+                "-IDEPackageSupportDisableManifestSandbox=YES",
+            ])
+            .current_dir(test_dir)
+            .output()
+            .expect("spawn xcodebuild");
+        assert!(
+            out.status.success(),
+            "xcodebuild failed ({}):\nstdout={}\nstderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    });
+
+    std::fs::remove_dir_all(test_dir).ok();
+    std::fs::remove_dir_all(&derived_data).ok();
+    assert_eq!(code, 0, "sandbox_allows_xcodebuild_deriveddata failed");
 }

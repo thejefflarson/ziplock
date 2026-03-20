@@ -12,12 +12,22 @@ ziplock
   │    └─ DNS-over-HTTPS → Cloudflare 1.1.1.3 (blocks malware + adult content)
   │
   └─ sandbox_init() → claude --dangerously-skip-permissions
-       └─ writes restricted to CWD, /tmp, $HOME (excluding ~/Library)
-       └─ reads blocked for ~/Library, /Library, /System
+       └─ writes restricted to CWD, /tmp, $HOME (excluding most of ~/Library)
+       └─ reads blocked for ~/Library, /Library, /System (with developer tool carve-outs)
        └─ all network forced through localhost proxy
 ```
 
-**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, except `~/Library/Caches`). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for `~/Library/Caches`, `~/Library/Preferences`, and `~/Library/Keychains` (required for developer tools like `gh` that read tokens via the macOS Keychain API). Productivity credentials (`~/.ssh`, `~/.aws`) remain accessible. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule.
+**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, with carve-outs below). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for developer tooling. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule.
+
+Developer tool carve-outs (read + write unless noted):
+- `~/Library/Caches` — build tool caches (Go, npm, pip, Homebrew, Xcode)
+- `~/Library/Keychains` — Claude Code OAuth token storage
+- `~/Library/Developer` — xcodebuild DerivedData, CoreSimulator, archives
+- `~/Library/org.swift.swiftpm` — Swift Package Manager package cache
+- `~/Library/Preferences` — read-only; app preference plists
+- `~/Library/Security` — read-only; trust settings for codesign
+- `~/Library` directory entry — read + write on the directory itself (not contents); required for codesign ancestor-directory checks
+- `/Library/Developer`, `/Library/Keychains`, `/Library/Security`, system frameworks — read-only
 
 **Layer 2 — DNS-Filtering Proxy:** SOCKS5 + HTTP CONNECT proxies resolve all DNS via DNS-over-HTTPS (DoH) to Cloudflare 1.1.1.3, which blocks known malware and adult content domains. DoH encrypts queries end-to-end, preventing interception. The sandbox forces all traffic through localhost — no bypass possible. Direct connections to public IPs are also blocked.
 
@@ -50,8 +60,10 @@ ziplock -v
 
 | Attack | Mitigation |
 |--------|------------|
-| Write to system or sensitive home paths (`rm -rf /`, modify `~/Library`) | Sandbox blocks writes outside CWD/tmp/$HOME and to ~/Library |
-| Read cookies, browser data, app secrets | Sandbox blocks reads to ~/Library, /Library, /System (keychains readable for developer tools) |
+| Write to system files (`rm -rf /`, `/etc`, `/bin`) | Sandbox blocks writes outside CWD/tmp/$HOME |
+| Modify `~/Library` app data (cookies, Mail, Messages) | `file-write*` deny on `~/Library`; DerivedData/Caches/Keychains are the only write carve-outs |
+| Persist malware in `~/Library/LaunchAgents` | Covered by `~/Library` write deny |
+| Read browser cookies, app secrets, Safari data | Sandbox blocks reads to most of `~/Library`; only developer subtrees are accessible |
 | Download malware | Cloudflare 1.1.1.3 blocks known malware domains |
 | Connect to C2/phishing sites | DNS filter blocks categorized threats |
 | Bypass DNS via direct IP | Proxy blocks all public IP connections |
@@ -74,8 +86,7 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 |---|---|
 | Overwrite system files (`/etc`, `/bin`, `/usr`) | Seatbelt `file-write*` deny default |
 | Corrupt other users' home dirs | Seatbelt write restricted to `$HOME` |
-| Modify `~/Library` (cookies, app state, Mail) | Explicit `file-write*` deny on `~/Library` |
-| Modify keychains / insert rogue credential | Writes to `~/Library/Keychains` blocked |
+| Modify `~/Library` (cookies, app state, Mail, Messages) | Explicit `file-write*` deny on `~/Library` subpath |
 | Persist malware in `~/Library/LaunchAgents` | Covered by `~/Library` write deny |
 | Escape CWD via `--allow-path` symlink | Paths canonicalized before SBPL insertion |
 | SBPL injection via crafted path argument | `"` and `\` rejected; null bytes caught by `CString` |
@@ -106,16 +117,22 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Attack | Why not blocked |
 |---|---|
 | Read `~/Library/Keychains` (enumerate credential names) | Deliberate carve-out — required for `gh` and other developer tools |
+| Write `~/Library/Keychains` (create/modify keychain entries) | Deliberate carve-out — Claude Code stores OAuth tokens in the login keychain |
+| Read/write `~/Library/Developer` (Xcode DerivedData, CoreSimulator) | Required for xcodebuild to compile and sign Swift/ObjC projects |
+| List `~/Library` directory contents | Deliberate carve-out — `codesign` checks read/write permission on every ancestor directory before signing; `~/Library` must be accessible or xcodebuild signing fails. Reveals which app folders exist in `~/Library`. |
 | Read `~/.ssh` private keys | `~/.ssh` is under `$HOME`, which must be readable for Claude to work |
 | Connect to Docker/Podman/OrbStack socket and issue daemon API calls | Unix domain sockets are broadly allowed (required for mDNS, 1Password, and other IPC). Blocking specific container runtime sockets is impractical as new runtimes add new socket paths. **If you run Docker, Claude can call the Docker API.** |
 | Read `~/.aws`, `~/.config`, `.env`, etc. | Same — Claude needs project file access; no way to distinguish |
 | Exfiltrate to an *uncategorized* domain | DNS filter is Cloudflare's categorization list, not a whitelist |
 | Exfiltrate via allowed domains (`github.com`, `pastebin.com`) | Legitimate domains are unblocked by design |
 | Write anywhere in `$HOME` outside `~/Library` | Required for LSP plugins and build tools at startup |
+| SPM and xcodebuild nested sandboxing bypassed | `XBS_DISABLE_SANDBOXED_BUILDS=1` and `SWIFTPM_SANDBOX=0` are set — Swift build tools' own sandbox-exec calls would fail inside ziplock's SBPL profile. These env vars disable their inner sandboxing; ziplock's sandbox still constrains all child processes. |
 
 #### The keychain nuance
 
-Reading a keychain item's *value* requires calling `SecItemCopyMatching`, which communicates with `com.apple.SecurityServer` via Mach IPC. The sandbox allows `mach-lookup` broadly (required for Claude Code itself), so this call succeeds. **Ziplock does not prevent Claude from reading keychain secret values** — only from writing to the keychain database files. Users who need stronger credential isolation should not run tools that require keychain auth within Claude's scope.
+`~/Library/Keychains` is read **and write** accessible. Reads allow Claude Code to retrieve OAuth tokens via the Security framework. Writes allow Claude Code to store OAuth tokens in the login keychain — without this, re-authentication after sandbox profile changes would be broken. This means Claude can create new keychain entries or modify existing ones. Users who need stricter credential isolation should not run tools requiring keychain auth within Claude's scope.
+
+Reading a keychain item's *value* also requires `SecItemCopyMatching`, which communicates with `com.apple.SecurityServer` via Mach IPC. The sandbox allows `mach-lookup` broadly, so this call succeeds. **Ziplock does not prevent Claude from reading keychain secret values.**
 
 #### DNS filter limitations
 

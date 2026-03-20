@@ -95,8 +95,6 @@ pub fn generate_profile(
 (allow process-info*)
 (allow process-codesigning*)
 (allow signal (target same-sandbox))
-(allow file-clone)
-(allow file-link)
 
 ;; ── File reads: allow most, deny sensitive system trees ──────────────────
 (allow file-read*)
@@ -107,8 +105,12 @@ pub fn generate_profile(
     (subpath "/Library")
     (subpath "/System"))
 
-;; Carve-outs: frameworks and developer tools needed for process execution
+;; Carve-outs: system frameworks, developer tools, and ~/Library subtrees.
+;; literal "~/Library": codesign (via AMFI) checks file-read-data on ancestor
+;; directories; ~/Library itself must be readable or codesign refuses to sign
+;; any ~/Library/* file. `literal` matches only the exact path, not its contents.
 (allow file-read*
+    (literal "{home_str}/Library")
     (subpath "/System/Library/Frameworks")
     (subpath "/System/Library/PrivateFrameworks")
     (subpath "/System/Library/dyld")
@@ -122,11 +124,13 @@ pub fn generate_profile(
     (subpath "/Library/Apple")
     (subpath "/Library/Preferences")
     (subpath "/Library/Keychains")
+    (subpath "/Library/Security")
     (subpath "{home_str}/Library/Preferences")
     (subpath "{home_str}/Library/Caches")
     (subpath "{home_str}/Library/Keychains")
     (subpath "{home_str}/Library/Developer")
     (subpath "{home_str}/Library/org.swift.swiftpm")
+    (subpath "{home_str}/Library/Security")
 {ssh_agent_rule})
 
 ;; On macOS 11+, /bin, /usr, and /sbin are firmlinks into /System/Volumes/Root.
@@ -146,31 +150,43 @@ pub fn generate_profile(
     (subpath "/usr/local"))
 
 ;; ── File writes ────────────────────────────────────────────────────────
-;; Allow writes to home dir broadly (excluding sensitive ~/Library subtree)
-;; then restrict further to only allowed paths
+;; Allow writes to home dir broadly (excluding sensitive ~/Library subtree).
+;; /private/tmp: temp files (symlink /tmp -> /private/tmp; kernel resolves before SBPL,
+;;   so only the canonical /private/tmp rule is needed).
+;; /private/var/folders: per-user temp directory tree (e.g. /private/var/folders/<hash>/<rand>/T/).
+;;   Narrowed from /private/var to avoid granting write access to /private/var/db,
+;;   /private/var/log, etc. — those paths are root-owned in practice but sandbox
+;;   permission should be minimal.
 (allow file-write*
     (subpath "{cwd_str}")
     (subpath "{home_str}")
-    (subpath "/tmp")
     (subpath "/private/tmp")
-    (subpath "/private/var")
-    (subpath "/var")
+    (subpath "/private/var/folders")
 {extra_write_rules})
 ;; Block writes to sensitive home subdirectory
 (deny file-write*
     (subpath "{home_str}/Library"))
-;; Re-allow caches (build tools: Go, npm, pip, Homebrew, etc.)
+;; Re-allow specific ~/Library subtrees.
+;; - literal "~/Library": allows the directory ENTRY itself (not its contents).
+;;   codesign (via AMFI) calls sandbox_check() on every ancestor directory before
+;;   signing. If ~/Library itself is denied for file-read-data or file-write-data,
+;;   codesign refuses to sign any ~/Library/* file. `literal` matches only the
+;;   exact path — the subpath deny above still protects all files within ~/Library.
+;; - Caches: build tools (Go, npm, pip, Homebrew, Xcode) write here.
+;; - Keychains: OAuth token storage for Claude Code login.
+;; - Developer: xcodebuild DerivedData, CoreSimulator, Xcode archives.
+;; - org.swift.swiftpm: Swift Package Manager package cache.
 (allow file-write*
-    (subpath "{home_str}/Library/Caches"))
-;; Re-allow keychain writes (OAuth token storage for Claude Code login)
-(allow file-write*
-    (subpath "{home_str}/Library/Keychains"))
-;; Re-allow ~/Library/Developer (xcodebuild DerivedData, CoreSimulator, archives)
-(allow file-write*
-    (subpath "{home_str}/Library/Developer"))
-;; Re-allow ~/Library/org.swift.swiftpm (Swift Package Manager cache and security)
-(allow file-write*
+    (literal "{home_str}/Library")
+    (subpath "{home_str}/Library/Caches")
+    (subpath "{home_str}/Library/Keychains")
+    (subpath "{home_str}/Library/Developer")
     (subpath "{home_str}/Library/org.swift.swiftpm"))
+;; file-clone (clonefile APFS CoW) and file-link (hard links) must appear AFTER
+;; the deny rules because they fall under file-write* and would otherwise be
+;; overridden by (deny file-write* ~/Library). Placing them last ensures they win.
+(allow file-clone)
+(allow file-link)
 
 ;; ── Network ──────────────────────────────────────────────────────────────
 {network_rules}
@@ -178,8 +194,6 @@ pub fn generate_profile(
 ;; ── Mach / XPC IPC ──────────────────────────────────────────────────────
 (allow mach-lookup)
 (allow mach-register)
-(allow mach-priv-host-port)
-(allow mach-priv-task-port)
 (allow mach-task-name)
 (allow mach-per-user-lookup)
 
@@ -192,20 +206,16 @@ pub fn generate_profile(
 (allow file-ioctl)
 
 ;; ── Misc ─────────────────────────────────────────────────────────────────
-(allow sysctl*)
+(allow sysctl-read)
 (allow iokit*)
 (allow ipc*)
 (allow user-preference*)
 (allow system-socket)
-(allow lsopen)
 (allow darwin-notification-post)
-;; process-info* allows proc_pidinfo() calls used by monitoring tools and Node.js
-;; APIs (process.cpuUsage(), os.loadavg()). Note: /bin/ps and /usr/bin/top are
-;; setuid-root binaries — the macOS sandbox blocks setuid execution unconditionally,
-;; so those specific tools will not work inside any sandbox regardless of this rule.
-;; Valid ops: process-info-pidinfo, process-info-pidfdinfo, process-info-listpids,
-;; process-info-setcontrol, process-info-dirtycontrol, process-info-codesignature.
-(allow process-info*)
+;; Note: /bin/ps and /usr/bin/top are setuid-root binaries — the macOS sandbox blocks
+;; setuid execution unconditionally regardless of SBPL rules. process-info* (declared
+;; above in the Process section) still benefits non-setuid tools and Node.js APIs
+;; that call proc_pidinfo() directly (e.g. process.cpuUsage(), os.loadavg()).
 
 ;; ── Device and FD operations ─────────────────────────────────────────────
 (allow file-read* file-write*
@@ -312,6 +322,17 @@ pub fn spawn_claude(
         parts.join(":")
     };
     cmd.env("PATH", new_path);
+
+    // SPM uses sandbox-exec to sandbox swiftc when compiling Package.swift manifests,
+    // and also wraps certain build steps. sandbox-exec calls sandbox_apply() which is
+    // blocked inside ziplock's SBPL profile (no valid SBPL op name allows it selectively).
+    // Disable SPM's own sandboxing — ziplock's sandbox already constrains the process tree.
+    // XBS_DISABLE_SANDBOXED_BUILDS=1 disables build-phase sandbox-exec.
+    // SWIFTPM_SANDBOX=0 is a belt-and-suspenders fallback for open-source SPM toolchains.
+    // For Xcode's SwiftPM (manifest phase), Claude must pass
+    // -IDEPackageSupportDisableManifestSandbox=YES to xcodebuild invocations.
+    cmd.env("XBS_DISABLE_SANDBOXED_BUILDS", "1");
+    cmd.env("SWIFTPM_SANDBOX", "0");
 
     // Ensure /tmp/claude exists and set TMPDIR
     let tmp_claude = PathBuf::from("/tmp/claude");
@@ -742,6 +763,197 @@ mod tests {
         assert!(
             !profile.contains("file-link*"),
             "use file-link not file-link* (wildcard is invalid SBPL)"
+        );
+    }
+
+    #[test]
+    fn profile_has_security_carveout_for_codesign() {
+        // codesign --sign - uses sandbox_check() against ~/Library/Security and
+        // /Library/Security (trust settings) before signing. Without these carve-outs
+        // the check returns EPERM silently (sandbox_check doesn't log violations).
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(r#"(subpath "/Library/Security")"#),
+            "profile must allow reads to /Library/Security for codesign trust settings"
+        );
+        assert!(
+            profile.contains(r#"(subpath "/Users/test/Library/Security")"#),
+            "profile must allow reads to ~/Library/Security for codesign trust settings"
+        );
+        // Both carve-outs must appear after the deny rules (last-match-wins)
+        let deny_pos = profile.find(r#"(deny file-read*"#).unwrap();
+        let lib_sec_pos = profile.rfind(r#"(subpath "/Library/Security")"#).unwrap();
+        let home_sec_pos = profile
+            .rfind(r#"(subpath "/Users/test/Library/Security")"#)
+            .unwrap();
+        assert!(lib_sec_pos > deny_pos, "/Library/Security carve-out must follow deny");
+        assert!(
+            home_sec_pos > deny_pos,
+            "~/Library/Security carve-out must follow deny"
+        );
+    }
+
+    #[test]
+    fn profile_has_library_dir_literal_for_codesign() {
+        // codesign walks ancestor directories and calls sandbox_check() with file-read-data
+        // and file-write-data on each ancestor. If ~/Library itself is denied for either,
+        // codesign refuses to sign ANY file under ~/Library/* with "Operation not permitted".
+        // The fix: allow ~/Library as a literal (exact path only) so the directory entry
+        // is accessible, while subpath deny still blocks all files/subdirs within ~/Library.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        let literal = r#"(literal "/Users/test/Library")"#;
+        // Literal must appear in both a file-read* and file-write* allow block
+        assert!(
+            profile.contains(literal),
+            "profile must contain ~/Library literal for codesign ancestor check"
+        );
+        // Must appear AFTER both deny rules (last-match-wins)
+        let read_deny_pos  = profile.find(r#"(deny file-read*"#).unwrap();
+        let write_deny_pos = profile.find(r#"(deny file-write*"#).unwrap();
+        let first_lit_pos  = profile.find(literal).unwrap();
+        assert!(
+            first_lit_pos > read_deny_pos,
+            "~/Library literal must follow deny file-read* rule"
+        );
+        // Write literal appears in a later block — use rfind for the write occurrence
+        let last_lit_pos = profile.rfind(literal).unwrap();
+        assert!(
+            last_lit_pos > write_deny_pos,
+            "~/Library literal must follow deny file-write* rule"
+        );
+        // Subpath deny must still be present (protects ~/Library contents)
+        assert!(
+            profile.contains(r#"(subpath "/Users/test/Library")"#),
+            "profile must still deny file-read/write on ~/Library subpath"
+        );
+    }
+
+    #[test]
+    fn profile_write_tmp_uses_canonical_path() {
+        // /tmp is a symlink to /private/tmp; the kernel resolves symlinks before SBPL
+        // matching, so (subpath "/tmp") would never actually match — only /private/tmp is
+        // needed. Redundant rules add noise and obscure the actual scope.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(r#"(subpath "/private/tmp")"#),
+            "profile must allow writes to /private/tmp"
+        );
+        assert!(
+            !profile.contains(r#"(subpath "/tmp")"#),
+            "redundant /tmp rule should be absent (kernel resolves to /private/tmp)"
+        );
+    }
+
+    #[test]
+    fn profile_write_var_narrowed_to_folders() {
+        // Write access to /private/var is scoped to /private/var/folders (the per-user
+        // temp directory tree). Granting /private/var would include /private/var/db,
+        // /private/var/log, etc. — root-owned in practice but unnecessarily broad.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(r#"(subpath "/private/var/folders")"#),
+            "profile must allow writes to /private/var/folders"
+        );
+        assert!(
+            !profile.contains(r#"(subpath "/private/var")"#),
+            "broad /private/var write must be absent; use /private/var/folders"
+        );
+        assert!(
+            !profile.contains(r#"(subpath "/var")"#),
+            "redundant /var rule should be absent (kernel resolves to /private/var)"
+        );
+    }
+
+    #[test]
+    fn profile_excludes_mach_priv_ports() {
+        // mach-priv-host-port and mach-priv-task-port grant host-level privilege port
+        // access, which is more powerful than required. Developer tools only need
+        // mach-lookup/mach-register for bootstrap service access.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !profile.contains("mach-priv-host-port"),
+            "profile must not grant mach-priv-host-port (excessive privilege)"
+        );
+        assert!(
+            !profile.contains("mach-priv-task-port"),
+            "profile must not grant mach-priv-task-port (excessive privilege)"
+        );
+    }
+
+    #[test]
+    fn profile_excludes_lsopen() {
+        // lsopen allows LaunchServices to open files via registered app handlers,
+        // enabling a prompt-injected Claude to launch browsers, mail clients, etc.
+        // Not required for Claude Code's core operation.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !profile.contains("lsopen"),
+            "profile must not allow lsopen (enables arbitrary app launch via LaunchServices)"
+        );
+    }
+
+    #[test]
+    fn profile_sysctl_read_only() {
+        // sysctl-read is sufficient for Claude Code's needs (checking hw.machine,
+        // kern.osproductversion, etc.). sysctl* would also grant write access,
+        // which is unnecessary and broader than required.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains("(allow sysctl-read)"),
+            "profile must use sysctl-read (not sysctl*)"
+        );
+        assert!(
+            !profile.contains("(allow sysctl*)"),
+            "profile must not use sysctl* (grants unnecessary sysctl write access)"
         );
     }
 

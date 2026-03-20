@@ -80,6 +80,23 @@ The initial profile denied all reads under `~/Library`. This blocked developer t
 
 **What remains blocked:** Writes to `~/Library/Keychains` are still denied (covered by the `~/Library` write deny rule with no carve-out), so Claude cannot create or modify keychain entries.
 
+### 10. `codesign` ancestor-directory check requires `~/Library` literal carve-out
+
+`codesign --sign -` (ad-hoc signing) is used by xcodebuild for every binary it produces. Before signing, codesign (via AMFI — AppleMobileFileIntegrity) internally calls `sandbox_check(getpid(), op, SANDBOX_FILTER_PATH, path)` on **every ancestor directory** of the file being signed, checking both `file-read-data` and `file-write-data`. If any ancestor returns DENY for either operation, codesign exits with "Operation not permitted" — even if the target file itself has full read/write permission.
+
+The problematic ancestor: `~/Library`. Because the profile has `(deny file-read/write* (subpath "~/Library"))`, the `~/Library` directory itself (not just its contents) appears as DENY to `sandbox_check()`. This causes codesign to fail on ANY file under `~/Library/*` — including `~/Library/Developer/DerivedData/`, `~/Library/Caches/`, etc. — even though those subdirectories have write carve-outs.
+
+**Diagnosis:** The key insight came from using `sandbox_check(getpid(), "file-read-data", 1, "/Users/jeff/Library")` inside a sandboxed process. The correct `SANDBOX_FILTER_PATH` type value is `1` (not `3` as commonly documented). The check returned DENY for `~/Library` while `/tmp` and `~/Desktop` returned ALLOW — exactly matching the set of paths where codesign failed vs. succeeded.
+
+**Fix:** Add two rules immediately after the deny, using `literal` instead of `subpath`:
+```
+(allow file-read* (literal "/Users/jeff/Library"))
+(allow file-write* (literal "/Users/jeff/Library"))
+```
+`(literal ...)` matches only the exact path, not subdirectories. This makes `~/Library` itself appear ALLOW to codesign's ancestor check, without opening up any content within `~/Library/`. The `(deny file-read/write* (subpath "~/Library"))` rule still protects all files and subdirectories within `~/Library`.
+
+**Security:** Allowing `file-read-data` and `file-write-data` on the `~/Library` directory entry means a process can `open("~/Library", O_RDONLY)` and `readdir()` to list `~/Library`'s direct children. This is a minor information disclosure (reveals what subdirectories exist in `~/Library`) but is acceptable since several existing carve-outs (Preferences, Caches, Developer, etc.) already allow reading those subdirectory trees.
+
 ### 9. macOS 11+ firmlinks cause `/bin/cat` (and other tools) to be "not found"
 
 On macOS 11+, `/bin`, `/usr`, and `/sbin` are [firmlinks](https://developer.apple.com/news/wwdc2019/607/) — directory-level hard links — into the sealed system snapshot at `/System/Volumes/Root`. The kernel resolves firmlinks before evaluating sandbox `(subpath ...)` rules, so:
@@ -101,10 +118,22 @@ Paths supplied via `--allow-path` are interpolated directly into the SBPL profil
 
 **Fix:** Call `std::fs::canonicalize()` on each `--allow-path` argument before insertion into the profile. Paths that do not exist on disk are rejected with a clear error message, since a non-existent path has no symlink to resolve and granting write access to it is almost certainly a mistake.
 
+### 11. Security review — minimal-privilege tightening
+
+A formal security review identified four areas where the profile granted more than the minimum required:
+
+**`/private/var` → `/private/var/folders`:** The original write rule `(subpath "/private/var")` covered `/private/var/db`, `/private/var/log`, etc. — system paths that are root-owned in practice but unnecessarily broad. The actual requirement is `/private/var/folders`, the per-user temp directory tree (e.g. `/private/var/folders/<hash>/<rand>/T/`). Narrowed accordingly. The redundant `/tmp` and `/var` rules (which are symlinks that the kernel resolves to `/private/tmp` and `/private/var` before SBPL matching, making those rules unreachable) were also removed.
+
+**Removed `mach-priv-host-port` and `mach-priv-task-port`:** These grant access to host-level privilege ports — more powerful than the bootstrap service lookup that developer tools actually require. `mach-lookup`, `mach-register`, `mach-task-name`, and `mach-per-user-lookup` are sufficient for keychain, launchd, and XPC service access.
+
+**Removed `lsopen`:** LaunchServices `lsopen` allows invoking any registered application for a file/URL type (browsers, email clients, etc.). This is a weak prompt-injection escalation path — a malicious context could instruct Claude to open a URL, triggering an external app launch. Not required for Claude Code's core operation.
+
+**`sysctl*` → `sysctl-read`:** `sysctl*` covered both reads and writes. Claude Code only needs to query kernel parameters (architecture, OS version, CPU count). `sysctl-read` expresses the actual intent and removes write access, even though sysctl writes generally require root anyway.
+
 ## Consequences
 
 - The write policy is home-directory-wide (minus ~/Library), which is broader than the original design intended
-- `~/Library/Keychains` is readable; credential names (but not values) are accessible to the sandboxed process
+- `~/Library/Keychains` is readable and writable; credential names and OAuth tokens are accessible to the sandboxed process
 - `--allow-path` requires the target to exist at launch time; deferred path creation is not supported
-- Mach IPC is fully open (`mach-lookup` etc. without service-name filters), which allows Claude Code to reach any Mach service, not just SecurityServer
+- Mach IPC is open for lookup/register/task-name without service-name filters, which allows Claude Code to reach any Mach service, not just SecurityServer
 - Log output never reaches the terminal; users must check `~/.claude/ziplock.log` to see proxy/sandbox activity
