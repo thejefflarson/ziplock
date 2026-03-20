@@ -1001,7 +1001,7 @@ fn sandbox_allows_xcodebuild_deriveddata() {
                 "-configuration",
                 "Debug",
                 "-derivedDataPath",
-                &derived_data,
+                derived_data,
                 "-IDEPackageSupportDisableManifestSandbox=YES",
             ])
             .current_dir(test_dir)
