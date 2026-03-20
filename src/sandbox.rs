@@ -118,6 +118,7 @@ pub fn generate_profile(
     (subpath "/Library/Developer")
     (subpath "/Library/Apple")
     (subpath "/Library/Preferences")
+    (subpath "/Library/Keychains")
     (subpath "{home_str}/Library/Preferences")
     (subpath "{home_str}/Library/Caches")
     (subpath "{home_str}/Library/Keychains")
