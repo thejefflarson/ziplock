@@ -42,6 +42,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // clap's built-in --version is swallowed by trailing_var_arg; handle it explicitly.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("ziplock {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     match run().await {
         Ok(code) => code,
         Err(e) => {
