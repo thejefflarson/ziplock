@@ -182,11 +182,29 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Keychains")
     (subpath "{home_str}/Library/Developer")
     (subpath "{home_str}/Library/org.swift.swiftpm"))
-;; file-clone (clonefile APFS CoW) and file-link (hard links) must appear AFTER
-;; the deny rules because they fall under file-write* and would otherwise be
-;; overridden by (deny file-write* ~/Library). Placing them last ensures they win.
-(allow file-clone)
-(allow file-link)
+;; file-clone (clonefile APFS CoW) and file-link (hard links) must be scoped to
+;; the same write-allowed paths. Without path filters, these operations bypass the
+;; (deny file-write* ~/Library) rule: either because file-clone is a subtype of
+;; file-write* (bare allow at the end would override the deny) or because the sandbox
+;; checks file-clone independently of file-write* (the ~/Library deny never applied
+;; to clones in the first place). Either way, a bare (allow file-clone) allows
+;; clonefile() or link() into protected ~/Library subtrees.
+;;
+;; Mirror the file-write* allow → deny → carve-out structure exactly.
+(allow file-clone file-link
+    (subpath "{cwd_str}")
+    (subpath "{home_str}")
+    (subpath "/private/tmp")
+    (subpath "/private/var/folders")
+{extra_write_rules})
+(deny file-clone file-link
+    (subpath "{home_str}/Library"))
+(allow file-clone file-link
+    (literal "{home_str}/Library")
+    (subpath "{home_str}/Library/Caches")
+    (subpath "{home_str}/Library/Keychains")
+    (subpath "{home_str}/Library/Developer")
+    (subpath "{home_str}/Library/org.swift.swiftpm"))
 
 ;; ── Network ──────────────────────────────────────────────────────────────
 {network_rules}
@@ -739,6 +757,10 @@ mod tests {
         // file-link allows hard link creation (link() syscall).
         // NOTE: file-clone* and file-link* (with wildcard) are INVALID SBPL and
         // cause "unbound variable" at sandbox_init time — use the bare op names.
+        //
+        // These operations must be PATH-SCOPED to match the file-write* carve-outs.
+        // A bare (allow file-clone) without a path filter bypasses (deny file-write*
+        // ~/Library) — allowing clonefile() or link() into ~/Library/LaunchAgents etc.
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
@@ -747,13 +769,25 @@ mod tests {
             None,
         )
         .unwrap();
+        // Must allow file-clone and file-link for DerivedData paths
         assert!(
-            profile.contains("(allow file-clone)"),
-            "profile must allow file-clone for xcodebuild builtin-copy"
+            profile.contains("(allow file-clone file-link"),
+            "profile must allow file-clone and file-link for xcodebuild"
         );
         assert!(
-            profile.contains("(allow file-link)"),
-            "profile must allow file-link for hard link creation"
+            profile.contains(r#"(subpath "/Users/test/Library/Developer")"#),
+            "file-clone/file-link must reach ~/Library/Developer for xcodebuild"
+        );
+        // Must deny file-clone/file-link in ~/Library (same as file-write*)
+        assert!(
+            profile.contains("(deny file-clone file-link"),
+            "profile must deny file-clone/file-link in ~/Library to prevent persistence bypass"
+        );
+        let deny_pos = profile.find("(deny file-clone file-link").unwrap();
+        let allow_carveout_pos = profile.rfind("(allow file-clone file-link").unwrap();
+        assert!(
+            allow_carveout_pos > deny_pos,
+            "file-clone/file-link carve-outs must appear after the ~/Library deny"
         );
         // Wildcards must NOT be used — they are invalid SBPL
         assert!(
@@ -763,6 +797,38 @@ mod tests {
         assert!(
             !profile.contains("file-link*"),
             "use file-link not file-link* (wildcard is invalid SBPL)"
+        );
+    }
+
+    #[test]
+    fn profile_file_clone_cannot_reach_library_launchagents() {
+        // A bare (allow file-clone) without path filters lets a sandboxed process
+        // clonefile() into ~/Library/LaunchAgents even though file-write* is denied there.
+        // Verify the deny rule is present and positioned correctly.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        // The ~/Library deny must cover file-clone/file-link
+        assert!(
+            profile.contains("(deny file-clone file-link"),
+            "profile must deny file-clone/file-link to ~/Library"
+        );
+        let clone_deny_pos = profile.find("(deny file-clone file-link").unwrap();
+        // ~/Library/LaunchAgents must not appear as a carve-out
+        assert!(
+            !profile.contains("LaunchAgents"),
+            "~/Library/LaunchAgents must never be a file-clone/file-link carve-out"
+        );
+        // The write deny on ~/Library must come before file-write* carve-outs
+        let write_deny_pos = profile.find("(deny file-write*").unwrap();
+        assert!(
+            clone_deny_pos > write_deny_pos,
+            "file-clone deny should follow file-write* deny"
         );
     }
 
