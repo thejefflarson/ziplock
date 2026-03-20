@@ -15,7 +15,8 @@ unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
     fn sandbox_free_error(errorbuf: *mut c_char);
     // SANDBOX_FILTER_PATH=3, SANDBOX_CHECK_NO_REPORT=4; vararg is const char* path
-    fn sandbox_check(pid: nix::libc::pid_t, operation: *const c_char, op_type: c_int, ...) -> c_int;
+    fn sandbox_check(pid: nix::libc::pid_t, operation: *const c_char, op_type: c_int, ...)
+    -> c_int;
 }
 
 /// Returns true if we're already running inside a sandbox (nested sandbox_init is forbidden).
@@ -386,7 +387,10 @@ fn sandbox_allows_reads_to_system_preferences() {
         }
     });
 
-    assert_eq!(code, 0, "sandbox system preferences read test failed in child");
+    assert_eq!(
+        code, 0,
+        "sandbox system preferences read test failed in child"
+    );
 }
 
 #[test]
@@ -464,7 +468,10 @@ fn sandbox_allows_reads_to_system_keychains() {
         );
     });
 
-    assert_eq!(code, 0, "sandbox system keychains read test failed in child");
+    assert_eq!(
+        code, 0,
+        "sandbox system keychains read test failed in child"
+    );
 }
 
 #[test]
@@ -511,7 +518,10 @@ fn sandbox_allows_swift_package_manager() {
         std::fs::remove_file(&test_file).ok();
     });
 
-    assert_eq!(code, 0, "sandbox Swift Package Manager test failed in child");
+    assert_eq!(
+        code, 0,
+        "sandbox Swift Package Manager test failed in child"
+    );
 }
 
 // Spawning grandchild processes (cat, sh) inside a doubly-sandboxed process
@@ -671,18 +681,20 @@ fn sandbox_allows_codesign_ad_hoc() {
     let target_binary = format!("{test_dir}/test-binary");
     std::fs::copy("/bin/ls", &target_binary).expect("failed to copy /bin/ls for codesign test");
 
-    let profile = ziplock::sandbox::generate_profile(
-        Path::new(test_dir),
-        Path::new(&home),
-        &[],
-        true,
-        None,
-    )
-    .unwrap();
+    let profile =
+        ziplock::sandbox::generate_profile(Path::new(test_dir), Path::new(&home), &[], true, None)
+            .unwrap();
 
     let code = run_sandboxed(&profile, move || {
         let output = std::process::Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-", "--timestamp=none", "--generate-entitlement-der", &target_binary])
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--timestamp=none",
+                "--generate-entitlement-der",
+                &target_binary,
+            ])
             .output()
             .expect("failed to spawn codesign");
         assert!(
@@ -764,7 +776,13 @@ fn sandbox_allows_xcodebuild_framework_build() {
 
         // Generate the .xcodeproj
         let out = std::process::Command::new("xcodegen")
-            .args(["generate", "--spec", &format!("{test_dir}/project.yml"), "--project", test_dir])
+            .args([
+                "generate",
+                "--spec",
+                &format!("{test_dir}/project.yml"),
+                "--project",
+                test_dir,
+            ])
             .current_dir(test_dir)
             .output()
             .expect("failed to spawn xcodegen");
@@ -786,10 +804,14 @@ fn sandbox_allows_xcodebuild_framework_build() {
             .env("XBS_DISABLE_SANDBOXED_BUILDS", "1")
             .args([
                 "build",
-                "-project", &format!("{test_dir}/ZiplockTestApp.xcodeproj"),
-                "-scheme", "ZiplockTestApp",
-                "-configuration", "Debug",
-                "-derivedDataPath", &derived_data,
+                "-project",
+                &format!("{test_dir}/ZiplockTestApp.xcodeproj"),
+                "-scheme",
+                "ZiplockTestApp",
+                "-configuration",
+                "Debug",
+                "-derivedDataPath",
+                &derived_data,
                 "-IDEPackageSupportDisableManifestSandbox=YES",
             ])
             .current_dir(test_dir)
@@ -818,53 +840,70 @@ fn sandbox_allows_xcodebuild_framework_build() {
 #[test]
 #[ignore]
 fn sandbox_allows_codesign_in_library() {
-    if already_sandboxed() { return; }
+    if already_sandboxed() {
+        return;
+    }
     let home = std::env::var("HOME").unwrap();
-    let profile = ziplock::sandbox::generate_profile(
-        Path::new("/tmp"),
-        Path::new(&home), &[], true, None,
-    ).unwrap();
+    let profile =
+        ziplock::sandbox::generate_profile(Path::new("/tmp"), Path::new(&home), &[], true, None)
+            .unwrap();
 
     let code = run_sandboxed(&profile, move || {
         let home = std::env::var("HOME").unwrap();
 
         // Verify ~/Library itself is ALLOW inside the sandbox
         let check_r = {
-            let op   = CString::new("file-read-data").unwrap();
+            let op = CString::new("file-read-data").unwrap();
             let path = CString::new(format!("{home}/Library")).unwrap();
             unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 1, path.as_ptr()) }
         };
         let check_w = {
-            let op   = CString::new("file-write-data").unwrap();
+            let op = CString::new("file-write-data").unwrap();
             let path = CString::new(format!("{home}/Library")).unwrap();
             unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 1, path.as_ptr()) }
         };
-        assert_eq!(check_r, 0, "file-read-data on ~/Library must be ALLOW (codesign ancestor check)");
-        assert_eq!(check_w, 0, "file-write-data on ~/Library must be ALLOW (codesign ancestor check)");
+        assert_eq!(
+            check_r, 0,
+            "file-read-data on ~/Library must be ALLOW (codesign ancestor check)"
+        );
+        assert_eq!(
+            check_w, 0,
+            "file-write-data on ~/Library must be ALLOW (codesign ancestor check)"
+        );
 
         // codesign must work on files under ~/Library/Developer
-        let dev_file = format!("{home}/Library/Developer/Xcode/DerivedData/ziplock-cs-library-test");
+        let dev_file =
+            format!("{home}/Library/Developer/Xcode/DerivedData/ziplock-cs-library-test");
         std::fs::copy("/bin/ls", &dev_file).expect("copy binary to DerivedData");
         let out = std::process::Command::new("/usr/bin/codesign")
             .args(["--force", "--sign", "-", "--timestamp=none", &dev_file])
-            .output().expect("spawn codesign");
+            .output()
+            .expect("spawn codesign");
         std::fs::remove_file(&dev_file).ok();
-        assert!(out.status.success(),
+        assert!(
+            out.status.success(),
             "codesign in ~/Library/Developer failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim());
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
 
         // Also verify ~/Library/Caches (another carve-out subdirectory)
         let caches_file = format!("{home}/Library/Caches/ziplock-cs-library-test");
         std::fs::copy("/bin/ls", &caches_file).expect("copy binary to Caches");
         let out = std::process::Command::new("/usr/bin/codesign")
             .args(["--force", "--sign", "-", "--timestamp=none", &caches_file])
-            .output().expect("spawn codesign caches");
+            .output()
+            .expect("spawn codesign caches");
         std::fs::remove_file(&caches_file).ok();
-        assert!(out.status.success(),
+        assert!(
+            out.status.success(),
             "codesign in ~/Library/Caches failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim());
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     });
-    assert_eq!(code, 0, "sandbox_allows_codesign_in_library failed in sandbox");
+    assert_eq!(
+        code, 0,
+        "sandbox_allows_codesign_in_library failed in sandbox"
+    );
 }
 
 // End-to-end xcodebuild test using the default DerivedData location
@@ -889,7 +928,8 @@ fn sandbox_allows_xcodebuild_deriveddata() {
 
     let home = std::env::var("HOME").unwrap();
     let test_dir = "/tmp/ziplock-test-deriveddata";
-    let derived_data = format!("{home}/Library/Developer/Xcode/DerivedData/ziplock-test-deriveddata");
+    let derived_data =
+        format!("{home}/Library/Developer/Xcode/DerivedData/ziplock-test-deriveddata");
     std::fs::create_dir_all(test_dir).ok();
 
     let profile = ziplock::sandbox::generate_profile(
@@ -931,11 +971,21 @@ fn sandbox_allows_xcodebuild_deriveddata() {
         .expect("write main.swift");
 
         let out = std::process::Command::new("xcodegen")
-            .args(["generate", "--spec", &format!("{test_dir}/project.yml"), "--project", test_dir])
+            .args([
+                "generate",
+                "--spec",
+                &format!("{test_dir}/project.yml"),
+                "--project",
+                test_dir,
+            ])
             .current_dir(test_dir)
             .output()
             .expect("spawn xcodegen");
-        assert!(out.status.success(), "xcodegen failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "xcodegen failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
 
         // Build with DerivedData in ~/Library/Developer — exercises the ~/Library
         // literal carve-out: codesign checks file-read/write-data on ~/Library itself.
@@ -944,10 +994,14 @@ fn sandbox_allows_xcodebuild_deriveddata() {
             .env("XBS_DISABLE_SANDBOXED_BUILDS", "1")
             .args([
                 "build",
-                "-project", &format!("{test_dir}/ZiplockMinBuild.xcodeproj"),
-                "-scheme", "ZiplockMinBuild",
-                "-configuration", "Debug",
-                "-derivedDataPath", &derived_data,
+                "-project",
+                &format!("{test_dir}/ZiplockMinBuild.xcodeproj"),
+                "-scheme",
+                "ZiplockMinBuild",
+                "-configuration",
+                "Debug",
+                "-derivedDataPath",
+                &derived_data,
                 "-IDEPackageSupportDisableManifestSandbox=YES",
             ])
             .current_dir(test_dir)

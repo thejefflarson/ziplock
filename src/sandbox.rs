@@ -760,8 +760,12 @@ mod tests {
             profile.contains("(deny file-write* file-clone file-link"),
             "profile must deny file-write* file-clone file-link in ~/Library"
         );
-        let deny_pos = profile.find("(deny file-write* file-clone file-link").unwrap();
-        let allow_carveout_pos = profile.rfind("(allow file-write* file-clone file-link").unwrap();
+        let deny_pos = profile
+            .find("(deny file-write* file-clone file-link")
+            .unwrap();
+        let allow_carveout_pos = profile
+            .rfind("(allow file-write* file-clone file-link")
+            .unwrap();
         assert!(
             allow_carveout_pos > deny_pos,
             "file-clone/file-link carve-outs must appear after the ~/Library deny"
@@ -795,14 +799,18 @@ mod tests {
             profile.contains("(deny file-write* file-clone file-link"),
             "profile must deny file-write* file-clone file-link to ~/Library"
         );
-        let clone_deny_pos = profile.find("(deny file-write* file-clone file-link").unwrap();
+        let clone_deny_pos = profile
+            .find("(deny file-write* file-clone file-link")
+            .unwrap();
         // ~/Library/LaunchAgents must not appear as a carve-out
         assert!(
             !profile.contains("LaunchAgents"),
             "~/Library/LaunchAgents must never be a file-clone/file-link carve-out"
         );
         // The combined deny must appear before the carve-out allows (last-match-wins)
-        let carveout_pos = profile.rfind("(allow file-write* file-clone file-link").unwrap();
+        let carveout_pos = profile
+            .rfind("(allow file-write* file-clone file-link")
+            .unwrap();
         assert!(
             carveout_pos > clone_deny_pos,
             "file-write*/file-clone/file-link carve-outs must follow the ~/Library deny"
@@ -836,7 +844,10 @@ mod tests {
         let home_sec_pos = profile
             .rfind(r#"(subpath "/Users/test/Library/Security")"#)
             .unwrap();
-        assert!(lib_sec_pos > deny_pos, "/Library/Security carve-out must follow deny");
+        assert!(
+            lib_sec_pos > deny_pos,
+            "/Library/Security carve-out must follow deny"
+        );
         assert!(
             home_sec_pos > deny_pos,
             "~/Library/Security carve-out must follow deny"
@@ -865,9 +876,9 @@ mod tests {
             "profile must contain ~/Library literal for codesign ancestor check"
         );
         // Must appear AFTER both deny rules (last-match-wins)
-        let read_deny_pos  = profile.find(r#"(deny file-read*"#).unwrap();
+        let read_deny_pos = profile.find(r#"(deny file-read*"#).unwrap();
         let write_deny_pos = profile.find(r#"(deny file-write*"#).unwrap();
-        let first_lit_pos  = profile.find(literal).unwrap();
+        let first_lit_pos = profile.find(literal).unwrap();
         assert!(
             first_lit_pos > read_deny_pos,
             "~/Library literal must follow deny file-read* rule"
