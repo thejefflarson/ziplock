@@ -113,6 +113,7 @@ pub fn generate_profile(
     (subpath "/System/Library/CoreServices")
     (subpath "/System/Library/Perl")
     (subpath "/System/Library/OpenSSL")
+    (subpath "/System/Library/Sandbox")
     (subpath "/Library/Frameworks")
     (subpath "/Library/Developer")
     (subpath "/Library/Apple")

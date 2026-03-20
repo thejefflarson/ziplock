@@ -243,6 +243,55 @@ fn sandbox_allows_framework_reads() {
 }
 
 #[test]
+fn sandbox_allows_reads_to_system_sandbox_profiles() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    // sandbox-exec (used internally by xcodebuild to sandbox build steps and test
+    // runners) looks up named profiles like "system.sb" from
+    // /System/Library/Sandbox/Profiles/. Without this carve-out, reads to /System
+    // are denied and sandbox-exec fails with "unable to open 'system.sb': not found",
+    // causing xcodebuild test runs to fail even though they work outside ziplock.
+    let profiles_path = "/System/Library/Sandbox/Profiles";
+    if !Path::new(profiles_path).exists() {
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp/ziplock-test-sbprofiles"),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all("/tmp/ziplock-test-sbprofiles").ok();
+
+    let code = run_sandboxed(&profile, move || {
+        let result = std::fs::read_dir(profiles_path);
+        assert!(
+            result.is_ok(),
+            "should be able to read /System/Library/Sandbox/Profiles (needed for sandbox-exec/xcodebuild): {:?}",
+            result.err()
+        );
+        let system_sb = format!("{profiles_path}/system.sb");
+        if Path::new(&system_sb).exists() {
+            let result = std::fs::metadata(&system_sb);
+            assert!(
+                result.is_ok(),
+                "should be able to read system.sb: {:?}",
+                result.err()
+            );
+        }
+    });
+
+    assert_eq!(code, 0, "sandbox profiles read test failed in child");
+}
+
+#[test]
 fn sandbox_allows_xcode_developer_dir() {
     if already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
