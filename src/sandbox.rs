@@ -149,57 +149,34 @@ pub fn generate_profile(
     (subpath "/opt/homebrew")
     (subpath "/usr/local"))
 
-;; ── File writes ────────────────────────────────────────────────────────
-;; Allow writes to home dir broadly (excluding sensitive ~/Library subtree).
-;; /private/tmp: temp files (symlink /tmp -> /private/tmp; kernel resolves before SBPL,
-;;   so only the canonical /private/tmp rule is needed).
-;; /private/var/folders: per-user temp directory tree (e.g. /private/var/folders/<hash>/<rand>/T/).
-;;   Narrowed from /private/var to avoid granting write access to /private/var/db,
-;;   /private/var/log, etc. — those paths are root-owned in practice but sandbox
-;;   permission should be minimal.
-(allow file-write*
+;; ── File writes (includes file-clone and file-link) ────────────────────────
+;; file-clone (clonefile APFS CoW, used by xcodebuild builtin-copy) and
+;; file-link (hard links) share the same path policy as file-write*. All three
+;; ops are listed together so the allow/deny/carve-out structure only exists once.
+;;
+;; /private/tmp: temp files (symlink /tmp -> /private/tmp; kernel resolves before
+;;   SBPL so only the canonical path is needed).
+;; /private/var/folders: per-user temp tree. Narrowed from /private/var to avoid
+;;   granting write access to /private/var/db, /private/var/log, etc.
+(allow file-write* file-clone file-link
     (subpath "{cwd_str}")
     (subpath "{home_str}")
     (subpath "/private/tmp")
     (subpath "/private/var/folders")
 {extra_write_rules})
-;; Block writes to sensitive home subdirectory
-(deny file-write*
+;; Block writes/clones/links into the sensitive ~/Library subtree.
+(deny file-write* file-clone file-link
     (subpath "{home_str}/Library"))
 ;; Re-allow specific ~/Library subtrees.
-;; - literal "~/Library": allows the directory ENTRY itself (not its contents).
-;;   codesign (via AMFI) calls sandbox_check() on every ancestor directory before
-;;   signing. If ~/Library itself is denied for file-read-data or file-write-data,
-;;   codesign refuses to sign any ~/Library/* file. `literal` matches only the
-;;   exact path — the subpath deny above still protects all files within ~/Library.
-;; - Caches: build tools (Go, npm, pip, Homebrew, Xcode) write here.
+;; - literal "~/Library": the directory ENTRY itself (not its contents).
+;;   codesign (via AMFI) calls sandbox_check() on every ancestor before signing;
+;;   if ~/Library itself is denied for file-write-data, codesign refuses to sign
+;;   any ~/Library/* file. `literal` matches only the exact path.
+;; - Caches: build tools (Go, npm, pip, Homebrew, Xcode).
 ;; - Keychains: OAuth token storage for Claude Code login.
 ;; - Developer: xcodebuild DerivedData, CoreSimulator, Xcode archives.
 ;; - org.swift.swiftpm: Swift Package Manager package cache.
-(allow file-write*
-    (literal "{home_str}/Library")
-    (subpath "{home_str}/Library/Caches")
-    (subpath "{home_str}/Library/Keychains")
-    (subpath "{home_str}/Library/Developer")
-    (subpath "{home_str}/Library/org.swift.swiftpm"))
-;; file-clone (clonefile APFS CoW) and file-link (hard links) must be scoped to
-;; the same write-allowed paths. Without path filters, these operations bypass the
-;; (deny file-write* ~/Library) rule: either because file-clone is a subtype of
-;; file-write* (bare allow at the end would override the deny) or because the sandbox
-;; checks file-clone independently of file-write* (the ~/Library deny never applied
-;; to clones in the first place). Either way, a bare (allow file-clone) allows
-;; clonefile() or link() into protected ~/Library subtrees.
-;;
-;; Mirror the file-write* allow → deny → carve-out structure exactly.
-(allow file-clone file-link
-    (subpath "{cwd_str}")
-    (subpath "{home_str}")
-    (subpath "/private/tmp")
-    (subpath "/private/var/folders")
-{extra_write_rules})
-(deny file-clone file-link
-    (subpath "{home_str}/Library"))
-(allow file-clone file-link
+(allow file-write* file-clone file-link
     (literal "{home_str}/Library")
     (subpath "{home_str}/Library/Caches")
     (subpath "{home_str}/Library/Keychains")
@@ -769,22 +746,22 @@ mod tests {
             None,
         )
         .unwrap();
-        // Must allow file-clone and file-link for DerivedData paths
+        // file-write*, file-clone, and file-link are listed together in each rule.
         assert!(
-            profile.contains("(allow file-clone file-link"),
-            "profile must allow file-clone and file-link for xcodebuild"
+            profile.contains("(allow file-write* file-clone file-link"),
+            "profile must allow file-write* file-clone file-link together"
         );
         assert!(
             profile.contains(r#"(subpath "/Users/test/Library/Developer")"#),
             "file-clone/file-link must reach ~/Library/Developer for xcodebuild"
         );
-        // Must deny file-clone/file-link in ~/Library (same as file-write*)
+        // Must deny all three ops in ~/Library
         assert!(
-            profile.contains("(deny file-clone file-link"),
-            "profile must deny file-clone/file-link in ~/Library to prevent persistence bypass"
+            profile.contains("(deny file-write* file-clone file-link"),
+            "profile must deny file-write* file-clone file-link in ~/Library"
         );
-        let deny_pos = profile.find("(deny file-clone file-link").unwrap();
-        let allow_carveout_pos = profile.rfind("(allow file-clone file-link").unwrap();
+        let deny_pos = profile.find("(deny file-write* file-clone file-link").unwrap();
+        let allow_carveout_pos = profile.rfind("(allow file-write* file-clone file-link").unwrap();
         assert!(
             allow_carveout_pos > deny_pos,
             "file-clone/file-link carve-outs must appear after the ~/Library deny"
@@ -813,22 +790,22 @@ mod tests {
             None,
         )
         .unwrap();
-        // The ~/Library deny must cover file-clone/file-link
+        // The ~/Library deny must cover file-write*, file-clone, and file-link together
         assert!(
-            profile.contains("(deny file-clone file-link"),
-            "profile must deny file-clone/file-link to ~/Library"
+            profile.contains("(deny file-write* file-clone file-link"),
+            "profile must deny file-write* file-clone file-link to ~/Library"
         );
-        let clone_deny_pos = profile.find("(deny file-clone file-link").unwrap();
+        let clone_deny_pos = profile.find("(deny file-write* file-clone file-link").unwrap();
         // ~/Library/LaunchAgents must not appear as a carve-out
         assert!(
             !profile.contains("LaunchAgents"),
             "~/Library/LaunchAgents must never be a file-clone/file-link carve-out"
         );
-        // The write deny on ~/Library must come before file-write* carve-outs
-        let write_deny_pos = profile.find("(deny file-write*").unwrap();
+        // The combined deny must appear before the carve-out allows (last-match-wins)
+        let carveout_pos = profile.rfind("(allow file-write* file-clone file-link").unwrap();
         assert!(
-            clone_deny_pos > write_deny_pos,
-            "file-clone deny should follow file-write* deny"
+            carveout_pos > clone_deny_pos,
+            "file-write*/file-clone/file-link carve-outs must follow the ~/Library deny"
         );
     }
 
