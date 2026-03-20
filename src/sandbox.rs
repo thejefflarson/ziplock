@@ -87,14 +87,16 @@ pub fn generate_profile(
 (deny default)
 
 ;; ── Process ──────────────────────────────────────────────────────────────
-;; process-exec* wildcard is silently ignored in SBPL (same trap as mach*).
-;; Enumerate ops explicitly: process-exec-interpreter is required for hashbang
-;; scripts (e.g. npm lifecycle hooks that invoke #!/usr/bin/env node scripts).
+;; Enumerate process-exec ops explicitly; process-exec-interpreter is required
+;; for hashbang scripts (e.g. npm lifecycle hooks invoking #!/usr/bin/env node).
 (allow process-exec)
 (allow process-exec-interpreter)
 (allow process-fork)
 (allow process-info*)
+(allow process-codesigning*)
 (allow signal (target same-sandbox))
+(allow file-clone)
+(allow file-link)
 
 ;; ── File reads: allow most, deny sensitive system trees ──────────────────
 (allow file-read*)
@@ -114,6 +116,7 @@ pub fn generate_profile(
     (subpath "/System/Library/Perl")
     (subpath "/System/Library/OpenSSL")
     (subpath "/System/Library/Sandbox")
+    (subpath "/System/Library/AssetsV2")
     (subpath "/Library/Frameworks")
     (subpath "/Library/Developer")
     (subpath "/Library/Apple")
@@ -628,6 +631,118 @@ mod tests {
         // allowed for process-exec so node, npm, python, etc. can be spawned.
         assert!(profile.contains(r#"(subpath "/opt/homebrew")"#));
         assert!(profile.contains(r#"(subpath "/usr/local")"#));
+    }
+
+    #[test]
+    fn profile_allows_process_codesigning() {
+        // process-codesigning* is required for `codesign --sign -` (ad-hoc signing),
+        // which xcodebuild runs when building frameworks and dylibs for simulators.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains("(allow process-codesigning*)"),
+            "profile must allow process-codesigning* for xcodebuild ad-hoc signing"
+        );
+    }
+
+    #[test]
+    fn profile_has_system_assetsv2_carveout() {
+        // /System/Library/AssetsV2 contains Metal Toolchain cryptex volumes.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(r#"(subpath "/System/Library/AssetsV2")"#),
+            "profile must allow reads to /System/Library/AssetsV2 for Metal Toolchain"
+        );
+    }
+
+    #[test]
+    fn profile_has_system_keychains_carveout() {
+        // /Library/Keychains is read by SecItemCopyMatching (xcodebuild, gh, etc.)
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(r#"(subpath "/Library/Keychains")"#),
+            "profile must allow reads to /Library/Keychains for SecItemCopyMatching"
+        );
+    }
+
+    #[test]
+    fn profile_has_swift_package_manager_carveout() {
+        // ~/Library/org.swift.swiftpm must be read+write for Swift Package Manager.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(r#"(subpath "/Users/test/Library/org.swift.swiftpm")"#),
+            "profile must have ~/Library/org.swift.swiftpm carve-out for Swift Package Manager"
+        );
+        // Write carve-out must appear after the ~/Library write deny
+        let deny_pos = profile.find(r#"(deny file-write*"#).unwrap();
+        let spm_write_pos = profile
+            .rfind(r#"(subpath "/Users/test/Library/org.swift.swiftpm")"#)
+            .unwrap();
+        assert!(
+            spm_write_pos > deny_pos,
+            "org.swift.swiftpm write carve-out must appear after ~/Library write deny"
+        );
+    }
+
+    #[test]
+    fn profile_allows_file_clone_and_link() {
+        // file-clone allows clonefile() (APFS copy-on-write) used by builtin-copy
+        // in xcodebuild when copying .bundle targets between DerivedData paths.
+        // file-link allows hard link creation (link() syscall).
+        // NOTE: file-clone* and file-link* (with wildcard) are INVALID SBPL and
+        // cause "unbound variable" at sandbox_init time — use the bare op names.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            profile.contains("(allow file-clone)"),
+            "profile must allow file-clone for xcodebuild builtin-copy"
+        );
+        assert!(
+            profile.contains("(allow file-link)"),
+            "profile must allow file-link for hard link creation"
+        );
+        // Wildcards must NOT be used — they are invalid SBPL
+        assert!(
+            !profile.contains("file-clone*"),
+            "use file-clone not file-clone* (wildcard is invalid SBPL)"
+        );
+        assert!(
+            !profile.contains("file-link*"),
+            "use file-link not file-link* (wildcard is invalid SBPL)"
+        );
     }
 
     #[test]

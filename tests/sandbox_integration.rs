@@ -387,6 +387,131 @@ fn sandbox_allows_reads_to_system_preferences() {
     assert_eq!(code, 0, "sandbox system preferences read test failed in child");
 }
 
+#[test]
+fn sandbox_allows_reads_to_system_assetsv2() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    // /System/Library/AssetsV2 contains cryptex volumes (e.g. MetalToolchainCryptex)
+    // that xcodebuild probes at startup. Without this carve-out, Metal Toolchain
+    // appears "missing" inside the sandbox even after `xcodebuild -downloadComponent
+    // MetalToolchain` has run successfully outside it.
+    let assets_path = "/System/Library/AssetsV2";
+    if !Path::new(assets_path).exists() {
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp/ziplock-test-assetsv2"),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all("/tmp/ziplock-test-assetsv2").ok();
+
+    let code = run_sandboxed(&profile, move || {
+        let result = std::fs::read_dir(assets_path);
+        assert!(
+            result.is_ok(),
+            "should be able to read /System/Library/AssetsV2 (Metal Toolchain/cryptex): {:?}",
+            result.err()
+        );
+    });
+
+    assert_eq!(code, 0, "sandbox AssetsV2 read test failed in child");
+}
+
+#[test]
+fn sandbox_allows_reads_to_system_keychains() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    // /Library/Keychains is read by SecItemCopyMatching (the macOS Keychain API)
+    // when fetching credentials. Without this carve-out, `xcodebuild` fails with
+    // "failedToStart" error 74 — logged as "CSSM Exception: 100001 UNIX[Operation
+    // not permitted]" in the system log. Developer tools like `gh` also use this path.
+    let keychain_path = "/Library/Keychains";
+    if !Path::new(keychain_path).exists() {
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp/ziplock-test-syskeychains"),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all("/tmp/ziplock-test-syskeychains").ok();
+
+    let code = run_sandboxed(&profile, move || {
+        let result = std::fs::read_dir(keychain_path);
+        assert!(
+            result.is_ok(),
+            "should be able to read /Library/Keychains (required for SecItemCopyMatching): {:?}",
+            result.err()
+        );
+    });
+
+    assert_eq!(code, 0, "sandbox system keychains read test failed in child");
+}
+
+#[test]
+fn sandbox_allows_swift_package_manager() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    // ~/Library/org.swift.swiftpm is used by Swift Package Manager for package cache,
+    // resolved dependencies, and security scope bookmarks. Without read+write access,
+    // SPM fails to resolve packages and xcodebuild cannot build Swift projects.
+    let home = std::env::var("HOME").unwrap();
+    let spm_dir = format!("{home}/Library/org.swift.swiftpm");
+
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp/ziplock-test-swiftpm"),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all("/tmp/ziplock-test-swiftpm").ok();
+    std::fs::create_dir_all(&spm_dir).ok();
+
+    let code = run_sandboxed(&profile, move || {
+        // Read access
+        let result = std::fs::read_dir(&spm_dir);
+        assert!(
+            result.is_ok(),
+            "should be able to read ~/Library/org.swift.swiftpm: {:?}",
+            result.err()
+        );
+
+        // Write access (SPM writes security scope bookmarks and package cache here)
+        let test_file = format!("{spm_dir}/.ziplock-write-test");
+        let write_result = std::fs::write(&test_file, b"ok");
+        assert!(
+            write_result.is_ok(),
+            "should be able to write to ~/Library/org.swift.swiftpm: {:?}",
+            write_result.err()
+        );
+        std::fs::remove_file(&test_file).ok();
+    });
+
+    assert_eq!(code, 0, "sandbox Swift Package Manager test failed in child");
+}
+
 // Spawning grandchild processes (cat, sh) inside a doubly-sandboxed process
 // (ziplock's own sandbox + the test's sandbox) causes a deadlock because
 // already_sandboxed() falsely returns false inside ziplock. Run manually:
