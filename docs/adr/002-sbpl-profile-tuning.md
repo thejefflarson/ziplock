@@ -130,10 +130,62 @@ A formal security review identified four areas where the profile granted more th
 
 **`sysctl*` → `sysctl-read`:** `sysctl*` covered both reads and writes. Claude Code only needs to query kernel parameters (architecture, OS version, CPU count). `sysctl-read` expresses the actual intent and removes write access, even though sysctl writes generally require root anyway.
 
+**`file-clone`/`file-link` scoped to write-allowed paths:** These operations are checked independently from `file-write*` by the sandbox, so a bare `(allow file-clone)` at the end of the profile bypassed the `(deny file-write* ~/Library)` rule — allowing `clonefile()` or `link()` into `~/Library/LaunchAgents` and similar protected paths. Fixed by merging all three ops into a single `(allow file-write* file-clone file-link ...)` allow/deny/carve-out structure, which is both correct and more readable.
+
+### 12. Mach service allowlist replaces bare `(allow mach-lookup)`
+
+**Context:** Bare `(allow mach-lookup)` exposes every Mach bootstrap service on the system (~500+ on a typical macOS install) as a potential pivot point for sandbox escape. The entire class of macOS Mach IPC privilege escalation CVEs — CVE-2018-4280 (blanket), CVE-2025-31258, Google Project Zero CVE-2024-54529, and the 10+ vulnerabilities found in [jhftss's 2024 research](https://jhftss.github.io/A-New-Era-of-macOS-Sandbox-Escapes/) — follow the same pattern:
+
+1. Sandboxed process calls `bootstrap_lookup()` to reach a privileged service
+2. The service has a vulnerability in its message handler
+3. The crafted Mach message triggers privilege escalation or sandbox escape
+
+Apple's own App Store sandbox (application.sb) uses an explicit `(allow mach-lookup (global-name "...") ...)` allowlist. Apple's own developer tool sandboxes (Xcode playground.sb on all platforms) use bare `(allow mach-lookup)` — they gave up on filtering for developer toolchains. ziplock takes the middle path: an explicit allowlist tuned to Claude Code and iOS/macOS development workflows.
+
+**Research methodology:**
+- Extracted all `global-name` entries from `/System/Library/Sandbox/Profiles/application.sb` (~120 services — the App Store baseline)
+- Extracted mach services from `/System/Library/Sandbox/Profiles/appsandbox-common.sb`, `com.apple.mtlcompilerservice.sb`, and `IconServices/framework.sb`
+- Extracted the embedded SwiftPM manifest sandbox from the `swift-package` binary (only 2 services: `lsd.mapdb` and `mobileassetd.v2`)
+- Cross-referenced with the ~500 registered services visible via `launchctl list`
+- Validated the allowlist by running the full test suite including the xcodebuild/DerivedData integration test under the real sandbox
+
+**Services excluded (attack surface reduction):**
+The ~70 excluded services include everything that Claude Code, as a CLI/TUI tool, has no reason to reach:
+- Window server / CoreAnimation (`windowserver.active`, `CARenderServer`, `dock.server`, `windowmanager.*`, `frontboard.*`)
+- Bluetooth (`BluetoothServices`, `server.bluetooth.*`)
+- Siri / speech recognition (`assistant.*`, `speechArbitrationServer`)
+- iCloud sync (`bird`, `kvsd`, `syncdefaultsd`)
+- Media services (`mediaremoted.xpc`, `midiserver`, `replayd`)
+- Phone / FaceTime / call services (`telephonyutilities.*`, `PurplePPTServer`)
+- Photos / Maps (`photos.service`, `geoanalyticsd`)
+- Screen capture (`screencapture.interactive`)
+
+These are precisely the service categories that appear most frequently in published Mach IPC CVE exploitation chains.
+
+**Services included (minimum required):**
+
+| Category | Key services | Why needed |
+|----------|-------------|------------|
+| Core OS | `cfprefsd.*`, `distributed_notifications@*`, `logd`, `FSEvents` | NSUserDefaults, framework delivery, logging, file watching |
+| Security | `SecurityServer`, `securityd.xpc`, `ocspd`, `TrustEvaluationAgent`, `tccd` | Keychain (OAuth tokens), TLS cert validation, TCC checks |
+| Directory | `opendirectoryd.*`, `DirectoryService.membership_v1` | `getpwuid()`, `NSUserName()`, group membership |
+| Launch Services | `CoreServices.coreservicesd`, `lsd.mapdb`, `lookupd` | codesign, xcodebuild path resolution |
+| Network | `configd`, `DNSConfiguration`, `nehelper` | curl, git, npm network stack |
+| Fonts | `fonts`, `FontObjectsServer` | Terminal rendering |
+| Developer tools | `mobileassetd.v2`, `iconservices`, `containermanagerd`, `cvmsServ`, `pluginkit.pkd` | Swift Package Manager, asset catalogs, iOS simulator, Metal compiler |
+| Diagnostics | `analyticsd`, `diagnosticd`, `spindump` | Apple framework requirements, xcodebuild hang detection |
+
+**Maintaining the allowlist:** If a new tool or workflow fails with a silent hang or `EPERM` from a framework call, add the missing service with a comment explaining why. The diagnostic tool is:
+```bash
+# In a separate terminal (requires sudo for full sandbox log access):
+sudo log stream --predicate 'eventMessage CONTAINS "deny mach-lookup"'
+```
+Then reproduce the failure and look for the blocked service name.
+
 ## Consequences
 
 - The write policy is home-directory-wide (minus ~/Library), which is broader than the original design intended
 - `~/Library/Keychains` is readable and writable; credential names and OAuth tokens are accessible to the sandboxed process
 - `--allow-path` requires the target to exist at launch time; deferred path creation is not supported
-- Mach IPC is open for lookup/register/task-name without service-name filters, which allows Claude Code to reach any Mach service, not just SecurityServer
+- Mach IPC is restricted to an explicit service allowlist; ~70 irrelevant GUI/media/sync services are unreachable
 - Log output never reaches the terminal; users must check `~/.claude/ziplock.log` to see proxy/sandbox activity

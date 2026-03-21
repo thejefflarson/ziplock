@@ -17,7 +17,7 @@ ziplock
        └─ all network forced through localhost proxy
 ```
 
-**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, with carve-outs below). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for developer tooling. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule.
+**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, with carve-outs below). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for developer tooling. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule. Mach IPC (`mach-lookup`) is restricted to an explicit allowlist of ~50 named services — eliminating ~70 irrelevant GUI, media, Bluetooth, Siri, and iCloud services from the reachable attack surface.
 
 Developer tool carve-outs (read + write unless noted):
 - `~/Library/Caches` — build tool caches (Go, npm, pip, Homebrew, Xcode)
@@ -102,13 +102,15 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Intercept or spoof DNS queries | All DNS over DoH (TLS to `family.cloudflare-dns.com`) |
 | DNS rebinding (domain → private IP after allow) | Resolved IP checked against `is_private_ip()` |
 
-#### Process
+#### Process and IPC
 
 | Attack | Blocked by |
 |---|---|
 | Spawn unsandboxed child process | Sandbox inherited across `exec` |
 | Remove sandbox from a child process | Seatbelt cannot be removed once applied |
 | Signal arbitrary other processes | `signal` restricted to `target same-sandbox` |
+| Mach IPC sandbox escape via privileged service (CVE-2018-4280 class) | `mach-lookup` restricted to an explicit ~50-service allowlist; window server, Bluetooth, Siri, iCloud, media, and phone services are unreachable |
+| LaunchServices app launch via prompt injection | `lsopen` removed; cannot invoke browser, mail client, or other registered app handlers |
 
 ### What ziplock does not block
 
@@ -132,7 +134,7 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 
 `~/Library/Keychains` is read **and write** accessible. Reads allow Claude Code to retrieve OAuth tokens via the Security framework. Writes allow Claude Code to store OAuth tokens in the login keychain — without this, re-authentication after sandbox profile changes would be broken. This means Claude can create new keychain entries or modify existing ones. Users who need stricter credential isolation should not run tools requiring keychain auth within Claude's scope.
 
-Reading a keychain item's *value* also requires `SecItemCopyMatching`, which communicates with `com.apple.SecurityServer` via Mach IPC. The sandbox allows `mach-lookup` broadly, so this call succeeds. **Ziplock does not prevent Claude from reading keychain secret values.**
+Reading a keychain item's *value* also requires `SecItemCopyMatching`, which communicates with `com.apple.SecurityServer` via Mach IPC. `com.apple.SecurityServer` is in the `mach-lookup` allowlist (required for Claude Code's own OAuth token access), so this call succeeds. **Ziplock does not prevent Claude from reading keychain secret values.**
 
 #### DNS filter limitations
 
