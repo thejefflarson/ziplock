@@ -17,7 +17,7 @@ ziplock
        └─ all network forced through localhost proxy
 ```
 
-**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, with carve-outs below). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for developer tooling. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule. Mach IPC (`mach-lookup`) is restricted to an explicit allowlist of ~50 named services — eliminating ~70 irrelevant GUI, media, Bluetooth, Siri, and iCloud services from the reachable attack surface.
+**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, with carve-outs below). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for developer tooling. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule. Mach IPC (`mach-lookup`) is restricted to an explicit allowlist of ~65 named services — eliminating ~70 irrelevant GUI, media, Bluetooth, Siri, and iCloud services from the reachable attack surface. Two services (`pasteboard.1`, `lsd.modifydb`) are intentionally denied to block clipboard exfiltration and LaunchServices database writes.
 
 Developer tool carve-outs (read + write unless noted):
 - `~/Library/Caches` — build tool caches (Go, npm, pip, Homebrew, Xcode)
@@ -109,7 +109,9 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Spawn unsandboxed child process | Sandbox inherited across `exec` |
 | Remove sandbox from a child process | Seatbelt cannot be removed once applied |
 | Signal arbitrary other processes | `signal` restricted to `target same-sandbox` |
-| Mach IPC sandbox escape via privileged service (CVE-2018-4280 class) | `mach-lookup` restricted to an explicit ~50-service allowlist; window server, Bluetooth, Siri, iCloud, media, and phone services are unreachable |
+| Mach IPC sandbox escape via privileged service (CVE-2018-4280 class) | `mach-lookup` restricted to an explicit ~65-service allowlist; window server, Bluetooth, Siri, iCloud, media, and phone services are unreachable |
+| Exfiltrate data via clipboard | `com.apple.pasteboard.1` is not in the mach allowlist; Claude cannot read or write the system clipboard |
+| Hijack file type handlers via LaunchServices | `com.apple.lsd.modifydb` is not in the mach allowlist; Claude cannot register new app bundles or override file associations |
 | LaunchServices app launch to arbitrary registered apps | Limited by DNS proxy blocking malicious domains; `lsopen` is allowed (required for OAuth login flow) but browser runs in its own App Sandbox |
 
 ### What ziplock does not block
