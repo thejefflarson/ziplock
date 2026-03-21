@@ -187,7 +187,113 @@ pub fn generate_profile(
 {network_rules}
 
 ;; ── Mach / XPC IPC ──────────────────────────────────────────────────────
-(allow mach-lookup)
+;; Explicit allowlist instead of bare (allow mach-lookup). Eliminates ~70
+;; irrelevant GUI, media, Bluetooth, Siri, iCloud, and phone services from
+;; the App Store baseline, removing them as potential pivot points for
+;; mach IPC sandbox escapes (CVE-2018-4280, CVE-2025-31258, et al.).
+;;
+;; Sources: application.sb baseline, appsandbox-common.sb, com.apple.mtlcompilerservice.sb,
+;; swift-package embedded profile, IconServices framework.sb, and empirical requirements
+;; for Claude Code (Bun runtime) + xcodebuild/codesign/simulator workflows.
+;;
+;; If a new tool needs a service not listed here, the symptom is a silent hang
+;; or EPERM from a framework call. Add the service and document why.
+(allow mach-lookup
+    ;; ── Core OS ─────────────────────────────────────────────────────────
+    ;; Preferences (NSUserDefaults, CFPreferences — used by virtually everything)
+    (global-name "com.apple.cfprefsd.agent")
+    (global-name "com.apple.cfprefsd.daemon")
+    ;; Distributed notifications (NSDistributedNotificationCenter, framework delivery)
+    (global-name "com.apple.distributed_notifications@Uv3")
+    (global-name "com.apple.distributed_notifications@1v3")
+    (global-name "com.apple.system.notification_center")
+    ;; System logging (os_log, NSLog, used by all Apple frameworks)
+    (global-name "com.apple.logd")
+    (global-name "com.apple.logd.admin")
+    ;; File system events (used by build tools, LSP watchers, editors)
+    (global-name "com.apple.FSEvents")
+    ;; File coordination (NSFileCoordinator — used by Xcode build system)
+    (global-name "com.apple.FileCoordination")
+    ;; Disk arbitration (volume mount/unmount events)
+    (global-name "com.apple.DiskArbitration.diskarbitrationd")
+    ;; Spotlight metadata (MDItem APIs used by some build tools)
+    (global-name "com.apple.metadata.mds")
+    ;; Process lifecycle assertions (used by xcodebuild to prevent sleep during builds)
+    (global-name "com.apple.runningboard")
+    ;; Hang reporter (used by xcodebuild for build diagnostics)
+    (global-name "com.apple.spindump")
+    ;; ── Security / keychain ─────────────────────────────────────────────
+    ;; SecurityServer: keychain API (SecItemAdd/CopyMatching), authorization,
+    ;;   code signing. Required for Claude Code OAuth token storage and codesign.
+    (global-name "com.apple.SecurityServer")
+    (global-name "com.apple.securityd.xpc")
+    ;; OCSP certificate validation (TLS cert revocation checks)
+    (global-name "com.apple.ocspd")
+    ;; Certificate trust evaluation (TLS, code signing trust chains)
+    (global-name "com.apple.TrustEvaluationAgent")
+    (global-name "com.apple.security.pboxd")
+    ;; GSS/Kerberos (used by git with GSSAPI and some corporate auth schemes)
+    (global-name "com.apple.GSSCred")
+    (global-name "com.apple.KerberosHelper.LKDCHelper")
+    (global-name "org.h5l.kcm")
+    ;; TCC (privacy permission checks: file access, network, etc.)
+    (global-name "com.apple.tccd")
+    (global-name "com.apple.tccd.system")
+    ;; ── Directory services ───────────────────────────────────────────────
+    ;; User/group name lookups: getpwuid(), NSUserName(), NSHomeDirectory()
+    (global-name "com.apple.system.opendirectoryd.api")
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.DirectoryService.membership_v1")
+    ;; ── Launch Services / CoreServices ───────────────────────────────────
+    ;; Used by codesign, xcodebuild, and many Apple frameworks internally
+    (global-name "com.apple.CoreServices.coreservicesd")
+    (global-name "com.apple.coreservices.launchservicesd")
+    (global-name "com.apple.coreservices.launcherror-handler")
+    (global-name "com.apple.coreservices.quarantine-resolver")
+    (global-name "com.apple.coreservices.appleevents")
+    ;; Launch Services DB (required by codesign and xcodebuild path resolution)
+    (global-name "com.apple.lsd.mapdb")
+    (global-name "com.apple.lookupd")
+    (global-name "com.apple.logind")
+    (global-name "com.apple.xpc.loginitemregisterd")
+    (global-name "com.apple.xpc.smd")
+    ;; ── Network config ───────────────────────────────────────────────────
+    ;; Network interface/routing info (used by curl, git, npm, etc.)
+    (global-name "com.apple.SystemConfiguration.configd")
+    (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+    (global-name "com.apple.SystemConfiguration.NetworkInformation")
+    (global-name "com.apple.SystemConfiguration.helper")
+    ;; Network extension (used by VPN/proxy clients and system network stack)
+    (global-name "com.apple.nehelper")
+    (global-name "com.apple.nesessionmanager")
+    ;; ── Fonts ────────────────────────────────────────────────────────────
+    ;; Terminal rendering and xcodebuild asset processing
+    (global-name "com.apple.fonts")
+    (global-name "com.apple.FontObjectsServer")
+    (global-name "com.apple.FontRegistry.FontRegistryUIAgent")
+    ;; ── Developer tools ──────────────────────────────────────────────────
+    ;; Platform SDK asset downloads (required by swift-package and xcodebuild)
+    (global-name "com.apple.mobileassetd.v2")
+    ;; Icon services (used by xcodebuild when processing asset catalogs)
+    (global-name "com.apple.iconservices")
+    (global-name "com.apple.iconservices.store")
+    ;; Simulator container management (iOS/tvOS/watchOS simulator builds)
+    (global-name "com.apple.containermanagerd")
+    ;; GPU/Metal compiler service (used by xcodebuild for Metal shader compilation)
+    (global-name "com.apple.cvmsServ")
+    ;; PluginKit (Xcode extensions and build tool plugins)
+    (global-name "com.apple.pluginkit.pkd")
+    ;; ── Diagnostics / analytics ──────────────────────────────────────────
+    ;; Required by many Apple frameworks and tools (crashes, metrics, build analytics)
+    (global-name "com.apple.analyticsd")
+    (global-name "com.apple.diagnosticd")
+    (global-name "com.apple.rtcreportingd")
+    (global-name "com.apple.powerlog.plxpclogger.xpc")
+    ;; ── Input method ─────────────────────────────────────────────────────
+    ;; Terminal keyboard input (input method selection, IME services)
+    (global-name "com.apple.inputmethodkit.getxpcendpoint")
+    (global-name "com.apple.inputmethodkit.launchagent")
+    (global-name "com.apple.inputmethodkit.launcher"))
 (allow mach-register)
 (allow mach-task-name)
 (allow mach-per-user-lookup)
@@ -1012,7 +1118,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_no_security_server_mach_lookup() {
+    fn profile_mach_lookup_is_allowlisted_not_bare() {
+        // Bare (allow mach-lookup) without global-name filters exposes every Mach
+        // service on the system as a potential sandbox escape pivot (CVE-2018-4280,
+        // CVE-2025-31258, jhftss 10+ vulns research). The profile must use an explicit
+        // allowlist so GUI, media, Bluetooth, Siri, and iCloud services are unreachable.
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
@@ -1022,8 +1132,95 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !profile.contains("com.apple.SecurityServer"),
-            "SecurityServer Mach IPC should not be whitelisted (keychain bypass)"
+            !profile.contains("(allow mach-lookup)\n"),
+            "bare (allow mach-lookup) must not appear — use global-name allowlist"
         );
+        assert!(
+            profile.contains("(allow mach-lookup\n"),
+            "profile must have a filtered (allow mach-lookup ...) block"
+        );
+    }
+
+    #[test]
+    fn profile_mach_allowlist_contains_required_services() {
+        // Core services needed by Claude Code (Bun runtime) and developer tools.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        let required = [
+            // Security / keychain (Claude Code OAuth tokens, codesign)
+            "com.apple.SecurityServer",
+            "com.apple.securityd.xpc",
+            "com.apple.ocspd",
+            "com.apple.TrustEvaluationAgent",
+            // Preferences (NSUserDefaults — used by every framework)
+            "com.apple.cfprefsd.agent",
+            "com.apple.cfprefsd.daemon",
+            // Logging
+            "com.apple.logd",
+            // Network config (curl, git, npm)
+            "com.apple.SystemConfiguration.configd",
+            "com.apple.SystemConfiguration.DNSConfiguration",
+            // Developer tools
+            "com.apple.lsd.mapdb",
+            "com.apple.mobileassetd.v2",
+            "com.apple.iconservices",
+            "com.apple.containermanagerd",
+            "com.apple.cvmsServ",
+        ];
+        for svc in &required {
+            assert!(
+                profile.contains(svc),
+                "required mach service missing from allowlist: {svc}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_mach_allowlist_excludes_gui_media_icloud() {
+        // These services are irrelevant to a CLI/TUI tool and are excluded to
+        // reduce the attack surface for mach IPC sandbox escapes.
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        let excluded = [
+            // Window server — Claude Code is a CLI tool, no GUI rendering
+            "com.apple.windowserver.active",
+            "com.apple.CARenderServer",
+            "com.apple.windowmanager.server",
+            "com.apple.dock.server",
+            // Bluetooth — not needed
+            "com.apple.BluetoothServices",
+            // Siri / speech
+            "com.apple.assistant.analytics",
+            "com.apple.speechArbitrationServer",
+            // iCloud sync
+            "com.apple.bird",
+            "com.apple.kvsd",
+            // Media
+            "com.apple.mediaremoted.xpc",
+            "com.apple.midiserver",
+            // Phone / FaceTime
+            "com.apple.telephonyutilities.callservicesdaemon.voip",
+            "PurplePPTServer",
+            // Photos
+            "com.apple.photos.service",
+        ];
+        for svc in &excluded {
+            assert!(
+                !profile.contains(svc),
+                "GUI/media/iCloud service must not be in mach allowlist: {svc}"
+            );
+        }
     }
 }
