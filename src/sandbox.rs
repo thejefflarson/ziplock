@@ -277,8 +277,9 @@ pub fn generate_profile(
     ;; Icon services (used by xcodebuild when processing asset catalogs)
     (global-name "com.apple.iconservices")
     (global-name "com.apple.iconservices.store")
-    ;; Simulator container management (iOS/tvOS/watchOS simulator builds)
+    ;; Simulator container management and runtime disk image service (iOS/tvOS/watchOS simulator builds)
     (global-name "com.apple.containermanagerd")
+    (global-name "com.apple.CoreSimulator.simdiskimaged")
     ;; GPU/Metal compiler service (used by xcodebuild for Metal shader compilation)
     (global-name "com.apple.cvmsServ")
     ;; PluginKit (Xcode extensions and build tool plugins)
@@ -1184,6 +1185,7 @@ mod tests {
             "com.apple.mobileassetd.v2",
             "com.apple.iconservices",
             "com.apple.containermanagerd",
+            "com.apple.CoreSimulator.simdiskimaged",
             "com.apple.cvmsServ",
         ];
         for svc in &required {
