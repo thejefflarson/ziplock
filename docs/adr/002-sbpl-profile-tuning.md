@@ -166,26 +166,36 @@ These are precisely the service categories that appear most frequently in publis
 
 | Category | Key services | Why needed |
 |----------|-------------|------------|
-| Core OS | `cfprefsd.*`, `distributed_notifications@*`, `logd`, `FSEvents` | NSUserDefaults, framework delivery, logging, file watching |
-| Security | `SecurityServer`, `securityd.xpc`, `ocspd`, `TrustEvaluationAgent`, `tccd` | Keychain (OAuth tokens), TLS cert validation, TCC checks |
-| Directory | `opendirectoryd.*`, `DirectoryService.membership_v1` | `getpwuid()`, `NSUserName()`, group membership |
+| Core OS | `cfprefsd.*`, `distributed_notifications@*`, `logd`, `logd.events`, `FSEvents` | NSUserDefaults, framework delivery, logging, file watching, build log streaming |
+| Security | `SecurityServer`, `securityd.xpc`, `ocspd`, `TrustEvaluationAgent`, `trustd.agent`, `tccd`, `security.syspolicy.exec` | Keychain (OAuth tokens), TLS cert validation, TCC checks, Gatekeeper/codesign policy |
+| Directory | `opendirectoryd.*`, `DirectoryService.membership_v1`, `bsd.dirhelper` | `getpwuid()`, `NSUserName()`, group membership, per-user temp directory setup |
 | Launch Services | `CoreServices.coreservicesd`, `lsd.mapdb`, `lookupd` | codesign, xcodebuild path resolution |
 | Network | `configd`, `DNSConfiguration`, `nehelper` | curl, git, npm network stack |
 | Fonts | `fonts`, `FontObjectsServer` | Terminal rendering |
-| Developer tools | `mobileassetd.v2`, `iconservices`, `containermanagerd`, `cvmsServ`, `pluginkit.pkd` | Swift Package Manager, asset catalogs, iOS simulator, Metal compiler |
+| Developer tools | `mobileassetd.v2`, `iconservices`, `containermanagerd`, `cvmsServ`, `pluginkit.pkd` | Swift Package Manager, asset catalogs, Metal compiler, Xcode extensions |
+| Simulator / device | `CoreSimulator.CoreSimulatorService`, `CoreSimulator.simdiskimaged`, `CoreSimulator.SimLaunchHost-arm64`, `CoreDevice.CoreDeviceService` | iOS/tvOS/watchOS simulator lifecycle, runtime disk images, arm64 app launch, physical device deployment (Xcode 15+) |
+| Build system | `PowerManagement.control`, `backupd.sandbox.xpc` | Build activity power assertions, Time Machine exclusion of DerivedData |
 | Diagnostics | `analyticsd`, `diagnosticd`, `spindump` | Apple framework requirements, xcodebuild hang detection |
+
+**Intentional denies — blocked by design:**
+
+Two services were confirmed to be requested by xcodebuild child processes but are intentionally not added:
+
+- **`com.apple.pasteboard.1`** — Clipboard read/write service. Allowing this would let a prompt-injected Claude read the user's clipboard (credential exfiltration) or write to it (poisoning). The requesting process was `2.1.81` (the Claude Code Bun binary version number embedded in the process name). Claude Code does not need clipboard access for any build workflow.
+
+- **`com.apple.lsd.modifydb`** — LaunchServices database write endpoint. `lsregister` (spawned by xcodebuild) uses this to register newly-built app bundles with the system. Allowing it would let Claude register arbitrary file type handlers or override app associations — a prompt injection could use this to hijack what application opens `.pdf`, `.url`, or any other file type. `com.apple.lsd.mapdb` (read-only lookup, already in the allowlist) is sufficient for codesign and path resolution.
 
 **Maintaining the allowlist:** If a new tool or workflow fails with a silent hang or `EPERM` from a framework call, add the missing service with a comment explaining why. The diagnostic tool is:
 ```bash
 # In a separate terminal (requires sudo for full sandbox log access):
 sudo log stream --predicate 'eventMessage CONTAINS "deny mach-lookup"'
 ```
-Then reproduce the failure and look for the blocked service name.
+Then reproduce the failure and look for the blocked service name. Before adding any new service, consider whether the deny is a feature (pasteboard, lsd.modifydb) rather than a bug.
 
 ## Consequences
 
 - The write policy is home-directory-wide (minus ~/Library), which is broader than the original design intended
 - `~/Library/Keychains` is readable and writable; credential names and OAuth tokens are accessible to the sandboxed process
 - `--allow-path` requires the target to exist at launch time; deferred path creation is not supported
-- Mach IPC is restricted to an explicit service allowlist; ~70 irrelevant GUI/media/sync services are unreachable
+- Mach IPC is restricted to an explicit service allowlist (~65 allowed, ~70 GUI/media/sync services unreachable); two services (`pasteboard.1`, `lsd.modifydb`) are intentional denies that block clipboard access and LaunchServices database writes
 - Log output never reaches the terminal; users must check `~/.claude/ziplock.log` to see proxy/sandbox activity
