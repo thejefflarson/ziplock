@@ -313,6 +313,11 @@ pub fn generate_profile(
 (allow user-preference*)
 (allow system-socket)
 (allow darwin-notification-post)
+;; lsopen is required for Claude Code's OAuth browser launch (login flow).
+;; Residual risk: a prompt injection could open a browser to an attacker URL.
+;; Mitigated by: DNS proxy blocks malware/phishing domains; browser runs in
+;; its own App Sandbox; no capability to write+execute in the same step.
+(allow lsopen)
 ;; Note: /bin/ps and /usr/bin/top are setuid-root binaries — the macOS sandbox blocks
 ;; setuid execution unconditionally regardless of SBPL rules. process-info* (declared
 ;; above in the Process section) still benefits non-setuid tools and Node.js APIs
@@ -431,27 +436,15 @@ pub fn spawn_claude(
     //
     // XBS_DISABLE_SANDBOXED_BUILDS=1 — disables build-phase sandbox-exec (xcodebuild).
     // SWIFTPM_SANDBOX=0 — disables sandboxing in open-source SPM toolchains.
-    // IDEPackageSupportDisableManifestSandbox — disables the sandbox-exec wrapper that
-    //   Xcode applies when evaluating Package.swift manifests. Set via `defaults write`
-    //   so it takes effect for every xcodebuild invocation without Claude needing to
-    //   pass the flag explicitly. This is a persistent user default, but it's also the
-    //   correct setting for any developer machine running builds inside ziplock.
+    //
+    // IDEPackageSupportDisableManifestSandbox is NOT set here — it is an NSUserDefaults key
+    // that xcodebuild reads from ~/Library/Preferences/com.apple.dt.Xcode.plist.  There is
+    // no per-process mechanism to override NSUserDefaults without writing that plist, which
+    // would persist beyond ziplock's lifetime and affect Xcode sessions outside the sandbox.
+    // If you run Xcode-managed SPM builds inside ziplock, set this once manually:
+    //   defaults write com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES
     cmd.env("XBS_DISABLE_SANDBOXED_BUILDS", "1");
     cmd.env("SWIFTPM_SANDBOX", "0");
-    let defaults_status = std::process::Command::new("defaults")
-        .args([
-            "write",
-            "com.apple.dt.Xcode",
-            "IDEPackageSupportDisableManifestSandbox",
-            "-bool",
-            "YES",
-        ])
-        .status();
-    match defaults_status {
-        Ok(s) if s.success() => debug!("set IDEPackageSupportDisableManifestSandbox=YES"),
-        Ok(s) => debug!("defaults write exited {s} — xcodebuild manifest sandbox may fail"),
-        Err(e) => debug!("defaults write failed: {e} — xcodebuild manifest sandbox may fail"),
-    }
 
     // Ensure /tmp/claude exists and set TMPDIR
     let tmp_claude = PathBuf::from("/tmp/claude");
@@ -1094,10 +1087,12 @@ mod tests {
     }
 
     #[test]
-    fn profile_excludes_lsopen() {
-        // lsopen allows LaunchServices to open files via registered app handlers,
-        // enabling a prompt-injected Claude to launch browsers, mail clients, etc.
-        // Not required for Claude Code's core operation.
+    fn profile_allows_lsopen_for_auth() {
+        // lsopen is required for Claude Code's OAuth login flow: it opens the browser
+        // to the authentication URL via LaunchServices. Removed in v1.2.0; restored in
+        // v1.3.2 after confirming that the login flow silently breaks without it.
+        // Residual risk (arbitrary app launch via prompt injection) is mitigated by the
+        // DNS proxy blocking malicious domains and browsers running in their own sandbox.
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
@@ -1107,8 +1102,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !profile.contains("lsopen"),
-            "profile must not allow lsopen (enables arbitrary app launch via LaunchServices)"
+            profile.contains("(allow lsopen)"),
+            "profile must allow lsopen (required for Claude Code OAuth browser launch)"
         );
     }
 
