@@ -128,7 +128,7 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Exfiltrate to an *uncategorized* domain | DNS filter is Cloudflare's categorization list, not a whitelist |
 | Exfiltrate via allowed domains (`github.com`, `pastebin.com`) | Legitimate domains are unblocked by design |
 | Write anywhere in `$HOME` outside `~/Library` | Required for LSP plugins and build tools at startup |
-| SPM and xcodebuild nested sandboxing bypassed | `XBS_DISABLE_SANDBOXED_BUILDS=1` and `SWIFTPM_SANDBOX=0` are set — Swift build tools' own sandbox-exec calls would fail inside ziplock's SBPL profile. These env vars disable their inner sandboxing; ziplock's sandbox still constrains all child processes. |
+| SPM and xcodebuild nested sandboxing bypassed | `XBS_DISABLE_SANDBOXED_BUILDS=1`, `SWIFTPM_SANDBOX=0`, and `IDEPackageSupportDisableManifestSandbox=YES` (set via `defaults write` at startup) disable nested sandbox-exec calls that would fail inside ziplock's SBPL profile. ziplock's sandbox still constrains all child processes. |
 
 #### The keychain nuance
 

@@ -428,12 +428,30 @@ pub fn spawn_claude(
     // and also wraps certain build steps. sandbox-exec calls sandbox_apply() which is
     // blocked inside ziplock's SBPL profile (no valid SBPL op name allows it selectively).
     // Disable SPM's own sandboxing — ziplock's sandbox already constrains the process tree.
-    // XBS_DISABLE_SANDBOXED_BUILDS=1 disables build-phase sandbox-exec.
-    // SWIFTPM_SANDBOX=0 is a belt-and-suspenders fallback for open-source SPM toolchains.
-    // For Xcode's SwiftPM (manifest phase), Claude must pass
-    // -IDEPackageSupportDisableManifestSandbox=YES to xcodebuild invocations.
+    //
+    // XBS_DISABLE_SANDBOXED_BUILDS=1 — disables build-phase sandbox-exec (xcodebuild).
+    // SWIFTPM_SANDBOX=0 — disables sandboxing in open-source SPM toolchains.
+    // IDEPackageSupportDisableManifestSandbox — disables the sandbox-exec wrapper that
+    //   Xcode applies when evaluating Package.swift manifests. Set via `defaults write`
+    //   so it takes effect for every xcodebuild invocation without Claude needing to
+    //   pass the flag explicitly. This is a persistent user default, but it's also the
+    //   correct setting for any developer machine running builds inside ziplock.
     cmd.env("XBS_DISABLE_SANDBOXED_BUILDS", "1");
     cmd.env("SWIFTPM_SANDBOX", "0");
+    let defaults_status = std::process::Command::new("defaults")
+        .args([
+            "write",
+            "com.apple.dt.Xcode",
+            "IDEPackageSupportDisableManifestSandbox",
+            "-bool",
+            "YES",
+        ])
+        .status();
+    match defaults_status {
+        Ok(s) if s.success() => debug!("set IDEPackageSupportDisableManifestSandbox=YES"),
+        Ok(s) => debug!("defaults write exited {s} — xcodebuild manifest sandbox may fail"),
+        Err(e) => debug!("defaults write failed: {e} — xcodebuild manifest sandbox may fail"),
+    }
 
     // Ensure /tmp/claude exists and set TMPDIR
     let tmp_claude = PathBuf::from("/tmp/claude");
