@@ -240,10 +240,13 @@ pub fn generate_profile(
     (global-name "com.apple.tccd")
     (global-name "com.apple.tccd.system")
     ;; ── Directory services ───────────────────────────────────────────────
-    ;; User/group name lookups: getpwuid(), NSUserName(), NSHomeDirectory()
+    ;; User/group name lookups: getpwuid(), NSUserName(), NSHomeDirectory(), group membership
     (global-name "com.apple.system.opendirectoryd.api")
     (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.opendirectoryd.membership")
     (global-name "com.apple.system.DirectoryService.membership_v1")
+    ;; BSD per-user temp directory helper (creates/resolves $TMPDIR paths under /var/folders)
+    (global-name "com.apple.bsd.dirhelper")
     ;; ── Launch Services / CoreServices ───────────────────────────────────
     ;; Used by codesign, xcodebuild, and many Apple frameworks internally
     (global-name "com.apple.CoreServices.coreservicesd")
@@ -280,6 +283,8 @@ pub fn generate_profile(
     ;; Simulator container management and runtime disk image service (iOS/tvOS/watchOS simulator builds)
     (global-name "com.apple.containermanagerd")
     (global-name "com.apple.CoreSimulator.simdiskimaged")
+    ;; Power management activity assertions (xcodebuild holds a build activity assertion)
+    (global-name "com.apple.PowerManagement.control")
     ;; GPU/Metal compiler service (used by xcodebuild for Metal shader compilation)
     (global-name "com.apple.cvmsServ")
     ;; PluginKit (Xcode extensions and build tool plugins)
