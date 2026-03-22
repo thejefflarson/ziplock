@@ -28,8 +28,12 @@ struct Cli {
     allow_paths: Vec<PathBuf>,
 
     /// Skip DNS filtering, only sandbox filesystem
-    #[arg(long = "allow-network")]
+    #[arg(long = "dangerous-allow-network")]
     allow_network: bool,
+
+    /// Allow mach-priv-task-port (required for app-hosted xcodebuild test; grants task_for_pid() access)
+    #[arg(long = "dangerous-enable-mach-task-port")]
+    dangerous_enable_mach_task_port: bool,
 
     /// Show sandbox/proxy activity
     #[arg(short, long)]
@@ -99,7 +103,7 @@ async fn run() -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("could not determine CWD")?;
     let home = dirs_home().context("could not determine HOME")?;
 
-    // Start proxy (unless --allow-network)
+    // Start proxy (unless --dangerous-allow-network)
     let (ports, _shutdown_tx) = if !cli.allow_network {
         let resolver = dns::create_resolver()?;
         let (ports, shutdown_tx) = proxy::start(resolver).await?;
@@ -109,12 +113,21 @@ async fn run() -> Result<ExitCode> {
         );
         (ports, Some(shutdown_tx))
     } else {
-        warn!("--allow-network: DNS filtering disabled, full network access granted");
+        warn!("--dangerous-allow-network: DNS filtering disabled, full network access granted");
         eprintln!(
-            "ziplock: WARNING: --allow-network disables DNS filtering; Claude has unrestricted network access"
+            "ziplock: WARNING: --dangerous-allow-network disables DNS filtering; Claude has unrestricted network access"
         );
         (proxy::ProxyPorts { socks5: 0, http: 0 }, None)
     };
+
+    if cli.dangerous_enable_mach_task_port {
+        warn!(
+            "--dangerous-enable-mach-task-port: mach-priv-task-port enabled; Claude can call task_for_pid() on other processes"
+        );
+        eprintln!(
+            "ziplock: WARNING: --dangerous-enable-mach-task-port enables task_for_pid(); Claude can inspect or modify other processes"
+        );
+    }
 
     // Spawn claude with sandbox
     let mut child = sandbox::spawn_claude(
@@ -124,6 +137,7 @@ async fn run() -> Result<ExitCode> {
         &cli.claude_args,
         &cli.allow_paths,
         cli.allow_network,
+        cli.dangerous_enable_mach_task_port,
         &ports,
     )?;
 

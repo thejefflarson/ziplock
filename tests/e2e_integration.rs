@@ -84,7 +84,7 @@ fn sandboxed_write_cwd_only() {
     std::fs::create_dir_all(cwd).ok();
 
     let profile =
-        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None).unwrap();
+        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, false, None).unwrap();
 
     std::io::stdout().flush().ok();
     std::io::stderr().flush().ok();
@@ -158,7 +158,7 @@ fn claude_version_runs_in_sandbox() {
     std::fs::create_dir_all(cwd).ok();
 
     let profile =
-        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None).unwrap();
+        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, false, None).unwrap();
 
     let profile_for_closure = profile.clone();
     let mut cmd = Command::new(&claude_path);
@@ -233,7 +233,7 @@ fn claude_responds_in_sandbox() {
 
     // Use allow_network=true so the API call can reach Anthropic
     let profile =
-        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None).unwrap();
+        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, false, None).unwrap();
 
     let profile_for_closure = profile.clone();
     let mut cmd = Command::new(&claude_path);
@@ -317,6 +317,7 @@ fn sandboxed_read_permissions() {
         Path::new(&home),
         &[],
         true,
+        false,
         None,
     )
     .unwrap();

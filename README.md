@@ -50,7 +50,10 @@ ziplock -- -p "refactor the auth module"
 ziplock --allow-path /tmp/build-output
 
 # Skip DNS filtering (filesystem sandbox only)
-ziplock --allow-network
+ziplock --dangerous-allow-network
+
+# Allow task_for_pid() — required for xcodebuild test on app-hosted test targets
+ziplock --dangerous-enable-mach-task-port
 
 # Verbose mode — logs proxy connections, blocked domains
 ziplock -v

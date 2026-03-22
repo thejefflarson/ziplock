@@ -39,6 +39,7 @@ pub fn generate_profile(
     home: &Path,
     allow_paths: &[PathBuf],
     allow_network: bool,
+    dangerous_enable_mach_task_port: bool,
     ssh_agent_dir: Option<&Path>,
 ) -> Result<String> {
     let cwd_str = sanitize_sbpl_path(cwd)?;
@@ -63,6 +64,18 @@ pub fn generate_profile(
         format!("    (subpath \"{safe}\")\n")
     } else {
         String::new()
+    };
+
+    let mach_task_port_rule = if dangerous_enable_mach_task_port {
+        // mach-priv-task-port allows task_for_pid() — required for xcodebuild test with
+        // app-hosted test targets (IDELaunchServicesLauncher suspends+resumes the app
+        // process via its task port). Without it, xcodebuild test fails with
+        // "Failed to send resume to target process / Operation not permitted".
+        // Risk: a prompt injection could use task_for_pid() to inspect or modify
+        // other processes' memory. Only enable when running app-hosted test suites.
+        "(allow mach-priv-task-port)"
+    } else {
+        ""
     };
 
     let network_rules = if allow_network {
@@ -340,6 +353,7 @@ pub fn generate_profile(
 ;; Mitigated by: DNS proxy blocks malware/phishing domains; browser runs in
 ;; its own App Sandbox; no capability to write+execute in the same step.
 (allow lsopen)
+{mach_task_port_rule}
 ;; Note: /bin/ps and /usr/bin/top are setuid-root binaries — the macOS sandbox blocks
 ;; setuid execution unconditionally regardless of SBPL rules. process-info* (declared
 ;; above in the Process section) still benefits non-setuid tools and Node.js APIs
@@ -382,6 +396,7 @@ pub fn spawn_claude(
     claude_args: &[String],
     allow_paths: &[PathBuf],
     allow_network: bool,
+    dangerous_enable_mach_task_port: bool,
     ports: &ProxyPorts,
 ) -> Result<std::process::Child> {
     // Detect 1Password SSH agent socket for git operations
@@ -391,6 +406,7 @@ pub fn spawn_claude(
         home,
         allow_paths,
         allow_network,
+        dangerous_enable_mach_task_port,
         ssh_agent_dir.as_deref(),
     )?;
     debug!("SBPL profile:\n{profile}");
@@ -517,6 +533,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -531,6 +548,7 @@ mod tests {
             Path::new("/Users/test/project"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -547,6 +565,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -561,6 +580,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -585,6 +605,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -599,6 +620,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             true,
+            false,
             None,
         )
         .unwrap();
@@ -622,6 +644,7 @@ mod tests {
             Path::new("/Users/test"),
             &[dir1, dir2],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -638,6 +661,7 @@ mod tests {
                 r#"/tmp/evil")(allow network*)(subpath "/tmp"#,
             )],
             false,
+            false,
             None,
         );
         assert!(result.is_err());
@@ -651,6 +675,7 @@ mod tests {
             Path::new("/Users/test"),
             &[PathBuf::from("/tmp/evil\n)(allow network-outbound")],
             false,
+            false,
             None,
         );
         assert!(
@@ -663,6 +688,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         );
         assert!(result2.is_err(), "cwd with embedded CR should be rejected");
@@ -674,6 +700,7 @@ mod tests {
             Path::new(r#"/tmp/evil")(allow network*"#),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         );
@@ -693,6 +720,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -708,6 +736,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -725,6 +754,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             Some(Path::new(
                 "/Users/test/Library/Group Containers/2BUA8C4S2C.com.1password/t",
@@ -745,6 +775,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -779,6 +810,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -797,6 +829,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -813,6 +846,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -831,6 +865,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -847,6 +882,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -881,6 +917,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -930,6 +967,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -965,6 +1003,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -1004,6 +1043,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -1045,6 +1085,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -1068,6 +1109,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -1102,6 +1144,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -1116,6 +1159,40 @@ mod tests {
     }
 
     #[test]
+    fn profile_mach_task_port_off_by_default_enabled_by_flag() {
+        // mach-priv-task-port is off by default; opt-in with --dangerous-enable-mach-task-port.
+        // Required for xcodebuild test on app-hosted targets (IDELaunchServicesLauncher
+        // needs task_for_pid() to resume the suspended test process).
+        let default_profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !default_profile.contains("mach-priv-task-port"),
+            "mach-priv-task-port must be absent by default"
+        );
+
+        let enabled_profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            true, // dangerous_enable_mach_task_port
+            None,
+        )
+        .unwrap();
+        assert!(
+            enabled_profile.contains("(allow mach-priv-task-port)"),
+            "mach-priv-task-port must be present when flag is set"
+        );
+    }
+
+    #[test]
     fn profile_allows_lsopen_for_auth() {
         // lsopen is required for Claude Code's OAuth login flow: it opens the browser
         // to the authentication URL via LaunchServices. Removed in v1.2.0; restored in
@@ -1126,6 +1203,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -1145,6 +1223,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -1170,6 +1249,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            false,
             None,
         )
         .unwrap();
@@ -1190,6 +1270,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
@@ -1232,6 +1313,7 @@ mod tests {
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
+            false,
             false,
             None,
         )
