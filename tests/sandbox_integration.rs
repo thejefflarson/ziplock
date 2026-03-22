@@ -114,7 +114,6 @@ fn sandbox_blocks_writes_outside_allowed_paths() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -153,7 +152,6 @@ fn sandbox_allows_reads_to_keychains() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -194,7 +192,6 @@ fn sandbox_allows_reads_to_productivity_creds() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -225,7 +222,6 @@ fn sandbox_allows_framework_reads() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -271,7 +267,6 @@ fn sandbox_allows_reads_to_system_sandbox_profiles() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -316,7 +311,6 @@ fn sandbox_allows_xcode_developer_dir() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -368,7 +362,6 @@ fn sandbox_allows_reads_to_system_preferences() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -421,7 +414,6 @@ fn sandbox_allows_reads_to_system_assetsv2() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -461,7 +453,6 @@ fn sandbox_allows_reads_to_system_keychains() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -500,7 +491,6 @@ fn sandbox_allows_swift_package_manager() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -551,7 +541,6 @@ fn sandbox_allows_cat_and_standard_unix_tools() {
         Path::new(&home),
         &[],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -651,7 +640,6 @@ fn sandbox_extra_allow_path() {
         Path::new(&home),
         &[PathBuf::from("/tmp/ziplock-extra-allowed")],
         true,
-        false,
         None,
     )
     .unwrap();
@@ -693,15 +681,9 @@ fn sandbox_allows_codesign_ad_hoc() {
     let target_binary = format!("{test_dir}/test-binary");
     std::fs::copy("/bin/ls", &target_binary).expect("failed to copy /bin/ls for codesign test");
 
-    let profile = ziplock::sandbox::generate_profile(
-        Path::new(test_dir),
-        Path::new(&home),
-        &[],
-        true,
-        false,
-        None,
-    )
-    .unwrap();
+    let profile =
+        ziplock::sandbox::generate_profile(Path::new(test_dir), Path::new(&home), &[], true, None)
+            .unwrap();
 
     let code = run_sandboxed(&profile, move || {
         let output = std::process::Command::new("/usr/bin/codesign")
@@ -754,7 +736,6 @@ fn sandbox_allows_xcodebuild_framework_build() {
         Path::new(&home),
         &[],
         true, // allow_network: skip DNS proxy so xcodebuild can reach Apple CDN if needed
-        false,
         None,
     )
     .unwrap();
@@ -863,15 +844,9 @@ fn sandbox_allows_codesign_in_library() {
         return;
     }
     let home = std::env::var("HOME").unwrap();
-    let profile = ziplock::sandbox::generate_profile(
-        Path::new("/tmp"),
-        Path::new(&home),
-        &[],
-        true,
-        false,
-        None,
-    )
-    .unwrap();
+    let profile =
+        ziplock::sandbox::generate_profile(Path::new("/tmp"), Path::new(&home), &[], true, None)
+            .unwrap();
 
     let code = run_sandboxed(&profile, move || {
         let home = std::env::var("HOME").unwrap();
@@ -962,7 +937,6 @@ fn sandbox_allows_xcodebuild_deriveddata() {
         Path::new(&home),
         &[],
         true, // allow_network: skip DNS proxy; test is offline but xcodebuild needs Apple CDN for toolchain metadata
-        false,
         None,
     )
     .unwrap();
@@ -1073,7 +1047,6 @@ fn sandbox_allows_xcodebuild_test() {
         Path::new(&home),
         &[],
         true, // allow_network: xcodebuild may reach Apple CDN for toolchain metadata
-        false,
         None,
     )
     .unwrap();

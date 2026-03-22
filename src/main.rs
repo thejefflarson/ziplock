@@ -31,10 +31,6 @@ struct Cli {
     #[arg(long = "dangerous-allow-network")]
     allow_network: bool,
 
-    /// Allow mach-priv-task-port (required for app-hosted xcodebuild test; grants task_for_pid() access)
-    #[arg(long = "dangerous-enable-mach-task-port")]
-    dangerous_enable_mach_task_port: bool,
-
     /// Show sandbox/proxy activity
     #[arg(short, long)]
     verbose: bool,
@@ -120,15 +116,6 @@ async fn run() -> Result<ExitCode> {
         (proxy::ProxyPorts { socks5: 0, http: 0 }, None)
     };
 
-    if cli.dangerous_enable_mach_task_port {
-        warn!(
-            "--dangerous-enable-mach-task-port: mach-priv-task-port enabled; Claude can call task_for_pid() on other processes"
-        );
-        eprintln!(
-            "ziplock: WARNING: --dangerous-enable-mach-task-port enables task_for_pid(); Claude can inspect or modify other processes"
-        );
-    }
-
     // Spawn claude with sandbox
     let mut child = sandbox::spawn_claude(
         &claude_path,
@@ -137,7 +124,6 @@ async fn run() -> Result<ExitCode> {
         &cli.claude_args,
         &cli.allow_paths,
         cli.allow_network,
-        cli.dangerous_enable_mach_task_port,
         &ports,
     )?;
 

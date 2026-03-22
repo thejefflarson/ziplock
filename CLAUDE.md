@@ -18,7 +18,6 @@ cargo build --release
 ./target/debug/ziplock -- -p "hello"      # pass args to claude
 ./target/debug/ziplock --allow-path /extra/dir   # grant write access to additional path
 ./target/debug/ziplock --dangerous-allow-network              # sandbox only, skip DNS proxy
-./target/debug/ziplock --dangerous-enable-mach-task-port      # allow task_for_pid() (needed for xcodebuild test on app targets)
 ```
 
 ## Logs

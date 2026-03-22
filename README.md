@@ -52,9 +52,6 @@ ziplock --allow-path /tmp/build-output
 # Skip DNS filtering (filesystem sandbox only)
 ziplock --dangerous-allow-network
 
-# Allow task_for_pid() — required for xcodebuild test on app-hosted test targets
-ziplock --dangerous-enable-mach-task-port
-
 # Verbose mode — logs proxy connections, blocked domains
 ziplock -v
 ```
@@ -135,6 +132,7 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Exfiltrate via allowed domains (`github.com`, `pastebin.com`) | Legitimate domains are unblocked by design |
 | Write anywhere in `$HOME` outside `~/Library` | Required for LSP plugins and build tools at startup |
 | SPM and xcodebuild nested sandboxing bypassed | `XBS_DISABLE_SANDBOXED_BUILDS=1` and `SWIFTPM_SANDBOX=0` are set as environment variables, disabling nested sandbox-exec calls that would fail inside ziplock's SBPL profile. ziplock's sandbox still constrains all child processes. For Xcode-managed Package.swift manifest evaluation, set once manually: `defaults write com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES` |
+| App-hosted `xcodebuild test` targets not supported | When xcodebuild runs inside ziplock's sandbox, macOS `launchservicesd` refuses to pass `DYLD_INSERT_LIBRARIES` (and other env vars) to apps launched via LaunchServices. Without `DYLD_INSERT_LIBRARIES`, the XCTest framework is never injected into the test host app and the test runner never connects. Plain `bundle.unit-test` targets (no `TEST_HOST`) work fine. |
 
 #### The keychain nuance
 
