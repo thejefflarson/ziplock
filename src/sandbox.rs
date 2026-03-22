@@ -156,13 +156,16 @@ pub fn generate_profile(
 ;;
 ;; /private/tmp: temp files (symlink /tmp -> /private/tmp; kernel resolves before
 ;;   SBPL so only the canonical path is needed).
-;; /private/var/folders: per-user temp tree. Narrowed from /private/var to avoid
+;; /private/var/folders: per-user temp tree ($TMPDIR). Narrowed from /private/var to avoid
 ;;   granting write access to /private/var/db, /private/var/log, etc.
+;; /private/var/tmp: secondary temp directory used by xcodebuild for test session
+;;   logarchives (written to /var/tmp which resolves to /private/var/tmp).
 (allow file-write* file-clone file-link
     (subpath "{cwd_str}")
     (subpath "{home_str}")
     (subpath "/private/tmp")
     (subpath "/private/var/folders")
+    (subpath "/private/var/tmp")
 {extra_write_rules})
 ;; Block writes/clones/links into the sensitive ~/Library subtree.
 (deny file-write* file-clone file-link
@@ -1057,9 +1060,10 @@ mod tests {
 
     #[test]
     fn profile_write_var_narrowed_to_folders() {
-        // Write access to /private/var is scoped to /private/var/folders (the per-user
-        // temp directory tree). Granting /private/var would include /private/var/db,
-        // /private/var/log, etc. — root-owned in practice but unnecessarily broad.
+        // Write access to /private/var is scoped to specific subdirectories:
+        // /private/var/folders ($TMPDIR per-user tree) and /private/var/tmp
+        // (xcodebuild test logarchives). Granting /private/var broadly would include
+        // /private/var/db, /private/var/log, etc. — root-owned but unnecessarily wide.
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
@@ -1073,8 +1077,14 @@ mod tests {
             "profile must allow writes to /private/var/folders"
         );
         assert!(
+            profile.contains(r#"(subpath "/private/var/tmp")"#),
+            "profile must allow writes to /private/var/tmp (xcodebuild test logarchives)"
+        );
+        // Note: (subpath "/private/var") is NOT a substring of (subpath "/private/var/folders")
+        // or (subpath "/private/var/tmp") because the closing `")` doesn't match.
+        assert!(
             !profile.contains(r#"(subpath "/private/var")"#),
-            "broad /private/var write must be absent; use /private/var/folders"
+            "broad /private/var write must be absent; only named subdirs are allowed"
         );
         assert!(
             !profile.contains(r#"(subpath "/var")"#),
