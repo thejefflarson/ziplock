@@ -1020,3 +1020,137 @@ fn sandbox_allows_xcodebuild_deriveddata() {
     std::fs::remove_dir_all(&derived_data).ok();
     assert_eq!(code, 0, "sandbox_allows_xcodebuild_deriveddata failed");
 }
+
+// Run `xcodebuild test` for a minimal macOS XCTest bundle inside the sandbox.
+// Exercises testmanagerd and testmanagerd.control (the XCTest runner daemon and
+// its control endpoint), plus the full build + sign + run path for unit tests.
+// Requires xcodegen on PATH (`brew install xcodegen`).
+// Run manually: cargo test -- --test-threads=1 --ignored sandbox_allows_xcodebuild_test
+#[test]
+#[ignore]
+fn sandbox_allows_xcodebuild_test() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    if which::which("xcodegen").is_err() {
+        eprintln!("skipping: xcodegen not found on PATH (brew install xcodegen)");
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    let test_dir = "/tmp/ziplock-test-xctest";
+    std::fs::create_dir_all(test_dir).ok();
+
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new(test_dir),
+        Path::new(&home),
+        &[],
+        true, // allow_network: xcodebuild may reach Apple CDN for toolchain metadata
+        None,
+    )
+    .unwrap();
+
+    let code = run_sandboxed(&profile, move || {
+        // A static library to test against
+        std::fs::create_dir_all(format!("{test_dir}/Sources/Lib")).ok();
+        std::fs::write(
+            format!("{test_dir}/Sources/Lib/Lib.swift"),
+            "public func answer() -> Int { 42 }\n",
+        )
+        .expect("write Lib.swift");
+
+        // XCTest bundle with one passing test
+        std::fs::create_dir_all(format!("{test_dir}/Sources/Tests")).ok();
+        std::fs::write(
+            format!("{test_dir}/Sources/Tests/LibTests.swift"),
+            "import XCTest\n\
+             @testable import ZiplockTestLib\n\
+             final class LibTests: XCTestCase {\n\
+             \x20   func testAnswer() { XCTAssertEqual(answer(), 42) }\n\
+             }\n",
+        )
+        .expect("write LibTests.swift");
+
+        // project.yml: static lib + macOS unit test bundle
+        std::fs::write(
+            format!("{test_dir}/project.yml"),
+            "name: ZiplockTestRunner\n\
+             targets:\n\
+             \x20 ZiplockTestLib:\n\
+             \x20\x20\x20 type: library.static\n\
+             \x20\x20\x20 platform: macOS\n\
+             \x20\x20\x20 deploymentTarget: \"14.0\"\n\
+             \x20\x20\x20 sources:\n\
+             \x20\x20\x20\x20\x20 - Sources/Lib\n\
+             \x20\x20\x20 settings:\n\
+             \x20\x20\x20\x20\x20 CODE_SIGN_IDENTITY: \"-\"\n\
+             \x20\x20\x20\x20\x20 CODE_SIGN_STYLE: Manual\n\
+             \x20\x20\x20\x20\x20 ENABLE_HARDENED_RUNTIME: NO\n\
+             \x20 ZiplockTestRunnerTests:\n\
+             \x20\x20\x20 type: bundle.unit-test\n\
+             \x20\x20\x20 platform: macOS\n\
+             \x20\x20\x20 deploymentTarget: \"14.0\"\n\
+             \x20\x20\x20 sources:\n\
+             \x20\x20\x20\x20\x20 - Sources/Tests\n\
+             \x20\x20\x20 dependencies:\n\
+             \x20\x20\x20\x20\x20 - target: ZiplockTestLib\n\
+             \x20\x20\x20 settings:\n\
+             \x20\x20\x20\x20\x20 CODE_SIGN_IDENTITY: \"-\"\n\
+             \x20\x20\x20\x20\x20 CODE_SIGN_STYLE: Manual\n\
+             \x20\x20\x20\x20\x20 ENABLE_HARDENED_RUNTIME: NO\n\
+             \x20\x20\x20\x20\x20 GENERATE_INFOPLIST_FILE: YES\n",
+        )
+        .expect("write project.yml");
+
+        // Generate .xcodeproj
+        let out = std::process::Command::new("xcodegen")
+            .args([
+                "generate",
+                "--spec",
+                &format!("{test_dir}/project.yml"),
+                "--project",
+                test_dir,
+            ])
+            .current_dir(test_dir)
+            .output()
+            .expect("spawn xcodegen");
+        assert!(
+            out.status.success(),
+            "xcodegen failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Run tests — macOS destination, DerivedData in test dir for easy cleanup
+        let derived_data = format!("{test_dir}/DerivedData");
+        let out = std::process::Command::new("xcodebuild")
+            .env("SWIFTPM_SANDBOX", "0")
+            .env("XBS_DISABLE_SANDBOXED_BUILDS", "1")
+            .args([
+                "test",
+                "-project",
+                &format!("{test_dir}/ZiplockTestRunner.xcodeproj"),
+                "-scheme",
+                "ZiplockTestRunnerTests",
+                "-destination",
+                "platform=macOS,arch=arm64",
+                "-derivedDataPath",
+                &derived_data,
+                "-IDEPackageSupportDisableManifestSandbox=YES",
+            ])
+            .current_dir(test_dir)
+            .output()
+            .expect("spawn xcodebuild test");
+        assert!(
+            out.status.success(),
+            "xcodebuild test failed ({}):\nstdout={}\nstderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    });
+
+    std::fs::remove_dir_all(test_dir).ok();
+    assert_eq!(code, 0, "sandbox_allows_xcodebuild_test failed");
+}
