@@ -293,6 +293,7 @@ pub fn generate_profile(
     (global-name "com.apple.CoreDevice.CoreDeviceService")
     ;; XCTest runner (required for xcodebuild test on simulator and device)
     (global-name "com.apple.testmanagerd")
+    (global-name "com.apple.testmanagerd.control")
     ;; Power management activity assertions (xcodebuild holds a build activity assertion)
     (global-name "com.apple.PowerManagement.control")
     ;; Time Machine exclusion registration (xcodebuild registers DerivedData as TM-excluded)
