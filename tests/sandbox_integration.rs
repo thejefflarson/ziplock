@@ -1154,3 +1154,104 @@ fn sandbox_allows_xcodebuild_test() {
     std::fs::remove_dir_all(test_dir).ok();
     assert_eq!(code, 0, "sandbox_allows_xcodebuild_test failed");
 }
+
+/// Verify the build→pkill→install→open workflow works inside the sandbox.
+///
+/// Requires running outside any sandbox (spawns real processes and uses lsopen).
+/// The victim process must be a real compiled binary (not a shell script) so that
+/// pkill can match it by process name. open uses status() + /dev/null I/O to avoid
+/// a pipe-inheritance hang: open daemonizes the launched app, which would otherwise
+/// inherit the stdout pipe and keep it open indefinitely.
+#[test]
+#[ignore]
+fn sandbox_allows_pkill_and_open() {
+    if already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    let app_dir = std::path::Path::new("/tmp/ZiplockTestApp.app/Contents/MacOS");
+    let contents_dir = std::path::Path::new("/tmp/ZiplockTestApp.app/Contents");
+    std::fs::create_dir_all(app_dir).unwrap();
+
+    // Compile a real binary: pause() keeps it alive under its own name so pkill -x finds it.
+    let src = "/tmp/ZiplockTestApp_main.c";
+    std::fs::write(src, "#include <unistd.h>\nint main(){pause();return 0;}\n").unwrap();
+    let exe_path = app_dir.join("ZiplockTestApp");
+    let cc = std::process::Command::new("clang")
+        .args([src, "-o"])
+        .arg(&exe_path)
+        .status()
+        .expect("clang");
+    assert!(cc.success(), "clang failed");
+    let _ = std::fs::remove_file(src);
+
+    std::fs::write(
+        contents_dir.join("Info.plist"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\
+         <plist version=\"1.0\"><dict>\
+         <key>CFBundleExecutable</key><string>ZiplockTestApp</string>\
+         <key>CFBundleIdentifier</key><string>com.ziplock.test</string>\
+         <key>CFBundlePackageType</key><string>APPL</string>\
+         <key>CFBundleVersion</key><string>1.0</string>\
+         </dict></plist>",
+    )
+    .unwrap();
+
+    // Launch the victim so there's something for pkill to kill.
+    let mut victim = std::process::Command::new(&exe_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start ZiplockTestApp");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let profile = ziplock::sandbox::generate_profile(
+        std::path::Path::new("/tmp"),
+        std::path::Path::new(&home),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+
+    let code = run_sandboxed(&profile, || {
+        // pkill must be able to signal a process outside the sandbox.
+        let status = std::process::Command::new("/usr/bin/pkill")
+            .args(["-x", "ZiplockTestApp"])
+            .status()
+            .expect("failed to run pkill");
+        assert!(
+            status.success(),
+            "pkill ZiplockTestApp failed ({status}) — signal or sysmond may be blocked"
+        );
+
+        // open must be able to launch an app via LaunchServices (lsopen).
+        // Redirect I/O to /dev/null: the launched app otherwise inherits this
+        // process's stdout pipe and keeps it open, causing output() to hang.
+        let status = std::process::Command::new("/usr/bin/open")
+            .args(["-g", "/tmp/ZiplockTestApp.app"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run open");
+        assert!(
+            status.success(),
+            "open ZiplockTestApp.app failed ({status}) — lsopen may be blocked"
+        );
+    });
+
+    let _ = victim.wait();
+    // Kill the instance open may have relaunched.
+    let _ = std::process::Command::new("/usr/bin/pkill")
+        .args(["-x", "ZiplockTestApp"])
+        .status();
+    std::fs::remove_dir_all("/tmp/ZiplockTestApp.app").ok();
+
+    assert_eq!(code, 0, "sandbox_allows_pkill_and_open failed");
+}

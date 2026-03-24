@@ -94,7 +94,8 @@ pub fn generate_profile(
 (allow process-fork)
 (allow process-info*)
 (allow process-codesigning*)
-(allow signal (target same-sandbox))
+;; allow signaling any user-owned process (needed for pkill to kill running app builds)
+(allow signal)
 
 ;; ── File reads: allow most, deny sensitive system trees ──────────────────
 (allow file-read*)
@@ -305,6 +306,8 @@ pub fn generate_profile(
     (global-name "com.apple.cvmsServ")
     ;; PluginKit (Xcode extensions and build tool plugins)
     (global-name "com.apple.pluginkit.pkd")
+    ;; System monitor daemon (used by pkill/pgrep for process enumeration by name)
+    (global-name "com.apple.sysmond")
     ;; ── Diagnostics / analytics ──────────────────────────────────────────
     ;; Required by many Apple frameworks and tools (crashes, metrics, build analytics)
     (global-name "com.apple.analyticsd")
@@ -335,6 +338,10 @@ pub fn generate_profile(
 (allow user-preference*)
 (allow system-socket)
 (allow darwin-notification-post)
+;; lsopen: required for `open MyApp.app` (dev workflow: build → kill → install → open)
+;; and Claude Code's OAuth browser launch. Residual risk: prompt injection could open a
+;; browser to an attacker URL; mitigated by DNS proxy blocking malicious domains.
+(allow lsopen)
 ;; Note: /bin/ps and /usr/bin/top are setuid-root binaries — the macOS sandbox blocks
 ;; setuid execution unconditionally regardless of SBPL rules. process-info* (declared
 ;; above in the Process section) still benefits non-setuid tools and Node.js APIs
@@ -1111,12 +1118,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_blocks_lsopen() {
-        // lsopen allows arbitrary app launch via LaunchServices — a sandbox escape vector
-        // if a prompt injection can supply a URL/path. Blocked since v1.3.4.
-        // Trade-off: Claude Code's OAuth browser launch will fail inside the sandbox;
-        // users must authenticate before running ziplock or use --dangerous-allow-network
-        // to bypass and re-authenticate.
+    fn profile_allows_lsopen() {
+        // lsopen is required for `open MyApp.app` (build → kill → install → open workflow)
+        // and Claude Code's OAuth browser launch. Residual risk (prompt injection opening
+        // a browser to an attacker URL) is mitigated by the DNS proxy blocking malicious
+        // domains and browsers running in their own App Sandbox.
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
@@ -1126,8 +1132,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !profile.contains("(allow lsopen)"),
-            "profile must not allow lsopen (sandbox escape risk)"
+            profile.contains("(allow lsopen)"),
+            "profile must allow lsopen (required for open/OAuth)"
         );
     }
 
