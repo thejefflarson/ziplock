@@ -115,7 +115,7 @@ fn sandbox_blocks_writes_outside_allowed_paths() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -154,7 +154,7 @@ fn sandbox_allows_reads_to_keychains() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -195,7 +195,7 @@ fn sandbox_allows_reads_to_productivity_creds() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -226,7 +226,7 @@ fn sandbox_allows_framework_reads() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -272,7 +272,7 @@ fn sandbox_allows_reads_to_system_sandbox_profiles() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -317,7 +317,7 @@ fn sandbox_allows_xcode_developer_dir() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -369,7 +369,7 @@ fn sandbox_allows_reads_to_system_preferences() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -422,7 +422,7 @@ fn sandbox_allows_reads_to_system_assetsv2() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -462,7 +462,7 @@ fn sandbox_allows_reads_to_system_keychains() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -501,7 +501,7 @@ fn sandbox_allows_swift_package_manager() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -552,7 +552,7 @@ fn sandbox_allows_cat_and_standard_unix_tools() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -652,7 +652,7 @@ fn sandbox_extra_allow_path() {
         &[PathBuf::from("/tmp/ziplock-extra-allowed")],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -699,7 +699,7 @@ fn sandbox_allows_codesign_ad_hoc() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -755,7 +755,7 @@ fn sandbox_allows_xcodebuild_framework_build() {
         &[],
         true, // allow_network: skip DNS proxy so xcodebuild can reach Apple CDN if needed
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -869,7 +869,7 @@ fn sandbox_allows_codesign_in_library() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -963,7 +963,7 @@ fn sandbox_allows_xcodebuild_deriveddata() {
         &[],
         true, // allow_network: skip DNS proxy; test is offline but xcodebuild needs Apple CDN for toolchain metadata
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -1074,7 +1074,7 @@ fn sandbox_allows_xcodebuild_test() {
         &[],
         true, // allow_network: xcodebuild may reach Apple CDN for toolchain metadata
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -1243,7 +1243,7 @@ fn sandbox_allows_pkill_and_open() {
         &[],
         true,
         None,
-        None,
+        &[],
     )
     .unwrap();
 
@@ -1282,4 +1282,210 @@ fn sandbox_allows_pkill_and_open() {
     std::fs::remove_dir_all("/tmp/ZiplockTestApp.app").ok();
 
     assert_eq!(code, 0, "sandbox_allows_pkill_and_open failed");
+}
+
+/// Probe what the sandbox denies when `op` tries to run.
+///
+/// Runs `sandbox_check()` on every path and mach service `op` is likely to need,
+/// then actually spawns `op item get` and captures its output.
+/// Run with: cargo test -- --test-threads=1 --ignored --nocapture op_probe
+#[test]
+#[ignore]
+fn op_probe() {
+    if already_sandboxed() {
+        eprintln!("must run outside ziplock sandbox");
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap();
+    // Detect all 1Password group containers the same way spawn_claude does.
+    let op_group_containers: Vec<PathBuf> = {
+        let gc = std::path::PathBuf::from(&home).join("Library/Group Containers");
+        std::fs::read_dir(&gc)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().to_lowercase();
+                        n.contains("1password") || n.contains("agilebits")
+                    })
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    eprintln!("op_group_containers detected: {op_group_containers:?}");
+
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp"),
+        Path::new(&home),
+        &[],
+        false,
+        None,
+        &op_group_containers,
+    )
+    .unwrap();
+
+    // ── control: run op BEFORE any sandbox is applied ────────────────────────
+    use std::io::Write as _;
+    eprintln!("\n── op control (before sandbox) ──────────────────────────────");
+    let ctrl = std::process::Command::new("op")
+        .args([
+            "item",
+            "get",
+            "ANTHROPIC_API_KEY",
+            "--reveal",
+            "--fields",
+            "credential",
+        ])
+        .output();
+    match ctrl {
+        Ok(out) => eprintln!("  exit: {} success={}", out.status, out.status.success()),
+        Err(e) => eprintln!("  spawn failed: {e}"),
+    }
+
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
+
+    match unsafe { nix::unistd::fork() }.expect("fork failed") {
+        nix::unistd::ForkResult::Child => {
+            if let Err(e) = apply_sandbox(&profile) {
+                eprintln!("sandbox_init failed: {e}");
+                std::process::exit(99);
+            }
+
+            // ── profile text (look for ~/.op rule) ────────────────────────────
+            eprintln!("\n── profile excerpt (file-read carve-outs) ──────────");
+            for line in profile.lines() {
+                if line.contains(".op") || line.contains("Application Support") {
+                    eprintln!("  {line}");
+                }
+            }
+
+            // ── mach-lookup probe (SANDBOX_FILTER_GLOBAL_NAME = 2) ────────────
+            let mach_services = [
+                "com.1password.1passwordHelper",
+                "com.1password.desktop.sendMessage",
+                "com.1password.browser-support.extension-helper",
+                "com.agilebits.onepassword7",
+                "com.agilebits.onepassword7-helper",
+                "com.apple.security.agent",
+                "com.apple.secd",
+                "com.apple.SecurityServer",
+                "com.apple.cfprefsd.agent",
+            ];
+            eprintln!("\n── mach-lookup ──────────────────────────────────────");
+            for svc in &mach_services {
+                let op = std::ffi::CString::new("mach-lookup").unwrap();
+                let name = std::ffi::CString::new(*svc).unwrap();
+                let r =
+                    unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 2, name.as_ptr()) };
+                eprintln!("  {} {svc}", if r == 0 { "ALLOW" } else { "DENY " });
+            }
+
+            // ── file-read-data probe (SANDBOX_FILTER_PATH = 1) ───────────────
+            let read_paths: Vec<String> = vec![
+                "/tmp".to_string(),
+                format!("{home}"),
+                format!("{home}/.ssh"),
+                format!("{home}/.op"),
+                format!("{home}/.op/config"),
+                format!("{home}/Library"),
+                format!("{home}/Library/Group Containers"),
+                op_group_containers
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .next()
+                    .unwrap_or_else(|| format!("{home}/Library/Group Containers/(none)")),
+                format!("{home}/Library/Application Support"),
+                format!("{home}/.config/op"),
+                format!("{home}/.config/op/config"),
+                format!("{home}/.config/op/op-daemon.sock"),
+                format!("{home}/Library/Application Support"),
+                format!("{home}/Library/Application Support/1Password"),
+                format!("{home}/Library/Application Support/com.agilebits.onepassword7"),
+                format!("{home}/Library/Containers"),
+                format!("{home}/Library/Containers/com.agilebits.onepassword7"),
+                format!("{home}/Library/Containers/2BUA8C4S2C.com.agilebits.onepassword7-helper"),
+                format!("{home}/Library/Containers/com.1password.1password-launcher"),
+                // Key sockets: s.sock = op CLI Desktop Integration, agent.sock = SSH agent
+                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password"),
+                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t"),
+                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/s.sock"),
+                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"),
+                format!("{home}/Library/Preferences/com.agilebits.onepassword7.plist"),
+                "/Applications/1Password 7.app".to_string(),
+                "/Applications/1Password.app".to_string(),
+            ];
+            eprintln!("\n── file-read-data ───────────────────────────────────");
+            for path in &read_paths {
+                let op = std::ffi::CString::new("file-read-data").unwrap();
+                let p = std::ffi::CString::new(path.as_str()).unwrap();
+                let r = unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 1, p.as_ptr()) };
+                eprintln!("  {} {path}", if r == 0 { "ALLOW" } else { "DENY " });
+            }
+
+            // ── file-write-data probe ─────────────────────────────────────────
+            eprintln!("\n── file-write-data ──────────────────────────────────");
+            let write_paths = [
+                format!("{home}/.config/op"),
+                format!("{home}/.config/op/config"),
+                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password"),
+                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/s.sock"),
+                "/tmp".to_string(),
+            ];
+            for path in &write_paths {
+                let op_str = std::ffi::CString::new("file-write-data").unwrap();
+                let p = std::ffi::CString::new(path.as_str()).unwrap();
+                let r =
+                    unsafe { sandbox_check(nix::libc::getpid(), op_str.as_ptr(), 1, p.as_ptr()) };
+                eprintln!("  {} {path}", if r == 0 { "ALLOW" } else { "DENY " });
+            }
+
+            // ── try connecting directly to s.sock (Desktop Integration socket) ─
+            eprintln!("\n── unix socket connect test ─────────────────────────");
+            use std::os::unix::net::UnixStream;
+            let ssock =
+                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/s.sock");
+            match UnixStream::connect(&ssock) {
+                Ok(_) => eprintln!("  CONNECTED to {ssock}"),
+                Err(e) => eprintln!("  FAILED to connect to {ssock}: {e}"),
+            }
+            let dsock = format!("{home}/.config/op/op-daemon.sock");
+            match UnixStream::connect(&dsock) {
+                Ok(_) => eprintln!("  CONNECTED to {dsock}"),
+                Err(e) => eprintln!("  FAILED to connect to {dsock}: {e}"),
+            }
+
+            // ── actually run op ───────────────────────────────────────────────
+            eprintln!("\n── op item get output ───────────────────────────────");
+            let result = std::process::Command::new("op")
+                .args([
+                    "item",
+                    "get",
+                    "ANTHROPIC_API_KEY",
+                    "--reveal",
+                    "--fields",
+                    "credential",
+                ])
+                .env("OP_DEBUG", "1")
+                .env("ALL_PROXY", "")
+                .env("HTTPS_PROXY", "")
+                .env("HTTP_PROXY", "")
+                .output();
+            match result {
+                Ok(out) => {
+                    eprintln!("  exit: {}", out.status);
+                    eprintln!("  stdout: {}", String::from_utf8_lossy(&out.stdout));
+                    eprintln!("  stderr: {}", String::from_utf8_lossy(&out.stderr));
+                }
+                Err(e) => eprintln!("  failed to spawn op: {e}"),
+            }
+
+            std::process::exit(0);
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            nix::sys::wait::waitpid(child, None).expect("waitpid failed");
+        }
+    }
 }

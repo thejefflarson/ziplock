@@ -40,7 +40,7 @@ pub fn generate_profile(
     allow_paths: &[PathBuf],
     allow_network: bool,
     ssh_agent_dir: Option<&Path>,
-    op_group_container: Option<&Path>,
+    op_group_containers: &[PathBuf],
 ) -> Result<String> {
     let cwd_str = sanitize_sbpl_path(cwd)?;
     let home_str = sanitize_sbpl_path(home)?;
@@ -66,12 +66,11 @@ pub fn generate_profile(
         String::new()
     };
 
-    let op_group_container_rule = if let Some(dir) = op_group_container {
+    let mut op_group_container_rules = String::new();
+    for dir in op_group_containers {
         let safe = sanitize_sbpl_path(dir)?;
-        format!("    (subpath \"{safe}\")\n")
-    } else {
-        String::new()
-    };
+        op_group_container_rules.push_str(&format!("    (subpath \"{safe}\")\n"));
+    }
 
     let network_rules = if allow_network {
         "  (allow network*)".to_string()
@@ -142,10 +141,9 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Developer")
     (subpath "{home_str}/Library/org.swift.swiftpm")
     (subpath "{home_str}/Library/Security")
-    ;; op CLI config (~/.op/config stores account credentials/service tokens)
-    (subpath "{home_str}/.op")
-    ;; 1Password group container: op CLI reads vault data from here
-{op_group_container_rule}{ssh_agent_rule})
+    ;; 1Password group containers: op CLI reads vault data and settings from here
+    ;; (~/.config/op is already allowed by the broad file-read* rule above)
+{op_group_container_rules}{ssh_agent_rule})
 
 ;; On macOS 11+, /bin, /usr, and /sbin are firmlinks into /System/Volumes/Root.
 ;; The kernel resolves firmlinks before evaluating sandbox subpath rules, so the
@@ -406,19 +404,22 @@ fn find_op_agent_socket(home: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Find the 1Password group container directory for op CLI read access.
-/// Returns the top-level group container entry (e.g. ~/Library/Group Containers/2BUA8C4S2C.com.agilebits).
-fn find_1password_group_container(home: &Path) -> Option<PathBuf> {
+/// Find all 1Password group container directories for op CLI read access.
+/// op v2 uses multiple containers (e.g. 2BUA8C4S2C.com.agilebits and 2BUA8C4S2C.com.1password);
+/// all are needed for settings file reads.
+fn find_1password_group_containers(home: &Path) -> Vec<PathBuf> {
     let group_containers = home.join("Library/Group Containers");
-    let entries = std::fs::read_dir(&group_containers).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy().to_lowercase();
-        if name_str.contains("1password") || name_str.contains("agilebits") {
-            return Some(entry.path());
-        }
-    }
-    None
+    let Ok(entries) = std::fs::read_dir(&group_containers) else {
+        return vec![];
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            name.contains("1password") || name.contains("agilebits")
+        })
+        .map(|e| e.path())
+        .collect()
 }
 
 /// Spawn the claude process with sandbox applied via pre_exec.
@@ -433,15 +434,15 @@ pub fn spawn_claude(
 ) -> Result<std::process::Child> {
     // Detect 1Password SSH agent socket for git operations
     let ssh_agent_dir = find_op_agent_socket(home);
-    // Detect 1Password group container for op CLI vault data access
-    let op_group_container = find_1password_group_container(home);
+    // Detect all 1Password group containers for op CLI vault data and settings access
+    let op_group_containers = find_1password_group_containers(home);
     let profile = generate_profile(
         cwd,
         home,
         allow_paths,
         allow_network,
         ssh_agent_dir.as_deref(),
-        op_group_container.as_deref(),
+        &op_group_containers,
     )?;
     debug!("SBPL profile:\n{profile}");
 
@@ -568,7 +569,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(profile.contains(r#"(subpath "/Users/test/project")"#));
@@ -584,7 +585,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(profile.contains(r#"(subpath "/Users/test/Library")"#));
@@ -600,7 +601,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(profile.contains(r#"(subpath "/System/Library/Frameworks")"#));
@@ -616,7 +617,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         // ~/Library/Caches must be readable (Go module cache, npm, pip, etc.)
@@ -640,7 +641,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(profile.contains(r#"(remote ip "localhost:*")"#));
@@ -655,7 +656,7 @@ mod tests {
             &[],
             true,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(profile.contains("(allow network*)"));
@@ -679,7 +680,7 @@ mod tests {
             &[dir1, dir2],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(profile.contains(&format!(r#"(subpath "{}")"#, canonical1.display())));
@@ -696,7 +697,7 @@ mod tests {
             )],
             false,
             None,
-            None,
+            &[],
         );
         assert!(result.is_err());
     }
@@ -710,7 +711,7 @@ mod tests {
             &[PathBuf::from("/tmp/evil\n)(allow network-outbound")],
             false,
             None,
-            None,
+            &[],
         );
         assert!(
             result.is_err(),
@@ -723,7 +724,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         );
         assert!(result2.is_err(), "cwd with embedded CR should be rejected");
     }
@@ -736,7 +737,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         );
         assert!(result.is_err());
     }
@@ -755,7 +756,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -772,7 +773,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -792,7 +793,7 @@ mod tests {
             Some(Path::new(
                 "/Users/test/Library/Group Containers/2BUA8C4S2C.com.1password/t",
             )),
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -805,27 +806,30 @@ mod tests {
 
     #[test]
     fn profile_op_group_container_carveout() {
+        let containers = vec![
+            PathBuf::from("/Users/test/Library/Group Containers/2BUA8C4S2C.com.agilebits"),
+            PathBuf::from("/Users/test/Library/Group Containers/2BUA8C4S2C.com.1password"),
+        ];
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
             false,
             None,
-            Some(Path::new(
-                "/Users/test/Library/Group Containers/2BUA8C4S2C.com.agilebits",
-            )),
+            &containers,
         )
         .unwrap();
         assert!(
             profile.contains(
                 r#"(subpath "/Users/test/Library/Group Containers/2BUA8C4S2C.com.agilebits")"#
             ),
-            "op group container should appear as a file-read carve-out"
+            "agilebits group container should appear as a file-read carve-out"
         );
-        // ~/.op config dir should always be present
         assert!(
-            profile.contains(r#"(subpath "/Users/test/.op")"#),
-            "~/.op should always be readable"
+            profile.contains(
+                r#"(subpath "/Users/test/Library/Group Containers/2BUA8C4S2C.com.1password")"#
+            ),
+            "com.1password group container should appear as a file-read carve-out"
         );
     }
 
@@ -837,7 +841,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         // /bin, /usr/bin, etc. are firmlinks into /System/Volumes/Root on macOS 11+.
@@ -871,7 +875,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         // npm lifecycle scripts spawn binaries from Homebrew; both paths must be
@@ -890,7 +894,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -908,7 +912,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -926,7 +930,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -944,7 +948,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -979,7 +983,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         // file-write*, file-clone, and file-link are listed together in each rule.
@@ -1028,7 +1032,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         // The ~/Library deny must cover file-write*, file-clone, and file-link together
@@ -1065,7 +1069,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1105,7 +1109,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         let literal = r#"(literal "/Users/test/Library")"#;
@@ -1146,7 +1150,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1171,7 +1175,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1205,7 +1209,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1230,7 +1234,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1250,7 +1254,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1275,7 +1279,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1297,7 +1301,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         let required = [
@@ -1340,7 +1344,7 @@ mod tests {
             &[],
             false,
             None,
-            None,
+            &[],
         )
         .unwrap();
         let excluded = [
