@@ -335,7 +335,14 @@ pub fn generate_profile(
 
 ;; ── Misc ─────────────────────────────────────────────────────────────────
 (allow sysctl-read)
+;; IOKit: required for terminal GPU/graphics queries (Bun runtime, Metal compiler services,
+;; xcodebuild asset catalog processing). Grants read/write to hardware device registries.
+;; Risk: Claude could enumerate USB/GPU devices; cannot escalate privileges or reach other users.
 (allow iokit*)
+;; IPC: POSIX and SysV shared memory and semaphores, required by Bun's worker threads,
+;; xcodebuild's parallel build coordination, and Swift runtime inter-process data structures.
+;; Risk: shared memory can be used for inter-process data transfer; mitigated by sandbox
+;; constraining which processes Claude can exec or fork.
 (allow ipc*)
 (allow user-preference*)
 (allow system-socket)

@@ -72,7 +72,7 @@ ziplock -v
 
 ## Threat model
 
-Ziplock is effective against **untargeted, opportunistic attacks** — the prompt-injection-downloads-malware class of threat. It provides meaningful friction against **targeted data exfiltration** via novel domains or raw IPs. It provides **no protection** against an adversary who uses allowed domains as exfil channels or who specifically targets in-scope credentials like `~/.ssh` private keys.
+Ziplock is effective against **untargeted, opportunistic attacks** — the prompt-injection-downloads-malware class of threat. It provides meaningful friction against **targeted data exfiltration** via novel domains or raw IPs. It provides **no protection** against an adversary who uses allowed domains as exfil channels, who specifically targets in-scope credentials like `~/.ssh` private keys, or who crafts a prompt injection that kills user processes via `pkill`/`kill` (signal permission is unrestricted for user-owned processes — required for the build→kill→install→open dev workflow).
 
 ### Attacker model
 
@@ -108,7 +108,7 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 |---|---|
 | Spawn unsandboxed child process | Sandbox inherited across `exec` |
 | Remove sandbox from a child process | Seatbelt cannot be removed once applied |
-| Signal arbitrary other processes | `signal` is unrestricted for user-owned processes — required for `pkill` to kill running app builds |
+| Signal arbitrary other processes | Not blocked — see accepted trade-offs |
 | Mach IPC sandbox escape via privileged service (CVE-2018-4280 class) | `mach-lookup` restricted to an explicit ~65-service allowlist; window server, Bluetooth, Siri, iCloud, media, and phone services are unreachable |
 | Exfiltrate data via clipboard | `com.apple.pasteboard.1` is not in the mach allowlist; Claude cannot read or write the system clipboard |
 | Hijack file type handlers via LaunchServices | `com.apple.lsd.modifydb` is not in the mach allowlist; Claude cannot register new app bundles or override file associations |
@@ -124,6 +124,7 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Write `~/Library/Keychains` (create/modify keychain entries) | Deliberate carve-out — Claude Code stores OAuth tokens in the login keychain |
 | Read/write `~/Library/Developer` (Xcode DerivedData, CoreSimulator) | Required for xcodebuild to compile and sign Swift/ObjC projects |
 | List `~/Library` directory contents | Deliberate carve-out — `codesign` checks read/write permission on every ancestor directory before signing; `~/Library` must be accessible or xcodebuild signing fails. Reveals which app folders exist in `~/Library`. |
+| Signal any user-owned process (SIGKILL terminal, editor, etc.) | `signal` is unrestricted for processes owned by the current user — required for `pkill <AppName>` in the build→kill→install→open dev workflow. SBPL has no mechanism to restrict signals by target process name, signal type, or process tree. A prompt injection crafting a `pkill` or `kill` command could kill the user's shell, editor, or other running apps. Cannot affect other users or escalate to root. |
 | Read `~/.ssh` private keys | `~/.ssh` is under `$HOME`, which must be readable for Claude to work |
 | Open browser or other registered app via LaunchServices | `lsopen` is required for Claude Code's OAuth login flow and `open MyApp.app`; a prompt injection could open a browser to an attacker-controlled URL, mitigated by the DNS proxy blocking malicious domains |
 | Connect to Docker/Podman/OrbStack socket and issue daemon API calls | Unix domain sockets are broadly allowed (required for mDNS, 1Password, and other IPC). Blocking specific container runtime sockets is impractical as new runtimes add new socket paths. **If you run Docker, Claude can call the Docker API.** |
