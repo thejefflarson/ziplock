@@ -67,9 +67,11 @@ pub fn generate_profile(
     };
 
     let mut op_group_container_rules = String::new();
+    let mut op_group_container_write_rules = String::new();
     for dir in op_group_containers {
         let safe = sanitize_sbpl_path(dir)?;
         op_group_container_rules.push_str(&format!("    (subpath \"{safe}\")\n"));
+        op_group_container_write_rules.push_str(&format!("    (subpath \"{safe}\")\n"));
     }
 
     let network_rules = if allow_network {
@@ -196,7 +198,11 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Caches")
     (subpath "{home_str}/Library/Keychains")
     (subpath "{home_str}/Library/Developer")
-    (subpath "{home_str}/Library/org.swift.swiftpm"))
+    (subpath "{home_str}/Library/org.swift.swiftpm")
+    ;; 1Password group containers: op CLI needs write access for SQLite WAL/SHM
+    ;; coordination files (required even for read-only database access) and for
+    ;; storing delegated session state when using Desktop App Integration.
+{op_group_container_write_rules})
 
 ;; ── Network ──────────────────────────────────────────────────────────────
 {network_rules}
