@@ -121,6 +121,10 @@ pub fn generate_profile(
 ;; any ~/Library/* file. `literal` matches only the exact path, not its contents.
 (allow file-read*
     (literal "{home_str}/Library")
+    ;; op CLI scans ~/Library/Group Containers to discover the 1Password socket path.
+    ;; The directory entry itself must be readable (literal, not subpath) or op fails
+    ;; at client init before it can find any containers.
+    (literal "{home_str}/Library/Group Containers")
     (subpath "/System/Library/Frameworks")
     (subpath "/System/Library/PrivateFrameworks")
     (subpath "/System/Library/dyld")
@@ -343,6 +347,10 @@ pub fn generate_profile(
     (global-name "com.1password.1passwordHelper")
     ;; XPC message channel from op CLI to 1Password Desktop app (app integration)
     (global-name "com.1password.desktop.sendMessage")
+    ;; Native messaging bridge: op CLI connects via 2BUA8C4S2C.com.1password.browser-helper
+    ;; to initiate Desktop App Integration (session delegation). Without this, sandbox_check
+    ;; blocks the mach-lookup and op fails with "connecting to desktop app".
+    (global-name "2BUA8C4S2C.com.1password.browser-helper")
     (global-name "com.agilebits.onepassword7-helper")
     (global-name "com.apple.security.agent")
     (global-name "com.apple.secd"))

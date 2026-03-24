@@ -1340,7 +1340,11 @@ fn op_probe() {
         ])
         .output();
     match ctrl {
-        Ok(out) => eprintln!("  exit: {} success={}", out.status, out.status.success()),
+        Ok(out) => {
+            eprintln!("  exit: {} success={}", out.status, out.status.success());
+            eprintln!("  stdout: {}", String::from_utf8_lossy(&out.stdout));
+            eprintln!("  stderr: {}", String::from_utf8_lossy(&out.stderr));
+        }
         Err(e) => eprintln!("  spawn failed: {e}"),
     }
 
@@ -1362,6 +1366,24 @@ fn op_probe() {
                 }
             }
 
+            // ── all mach operations probe (SANDBOX_FILTER_NONE = 0) ──────────
+            eprintln!("\n── mach operations (no filter) ─────────────────────────");
+            let mach_ops_no_filter = [
+                "mach-lookup",
+                "mach-register",
+                "mach-per-user-lookup",
+                "mach-cross-domain-lookup",
+                "mach-priv-host-port",
+                "mach-priv-task-port",
+                "mach-task-name",
+                "mach-kernel-endpoint",
+            ];
+            for op_name in &mach_ops_no_filter {
+                let op_cstr = std::ffi::CString::new(*op_name).unwrap();
+                let r = unsafe { sandbox_check(nix::libc::getpid(), op_cstr.as_ptr(), 0) };
+                eprintln!("  {} {op_name}", if r == 0 { "ALLOW" } else { "DENY " });
+            }
+
             // ── mach-lookup probe (SANDBOX_FILTER_GLOBAL_NAME = 2) ────────────
             let mach_services = [
                 "com.1password.1passwordHelper",
@@ -1373,6 +1395,8 @@ fn op_probe() {
                 "com.apple.secd",
                 "com.apple.SecurityServer",
                 "com.apple.cfprefsd.agent",
+                // Native messaging bridge — key service for Desktop App Integration
+                "2BUA8C4S2C.com.1password.browser-helper",
             ];
             eprintln!("\n── mach-lookup ──────────────────────────────────────");
             for svc in &mach_services {
@@ -1417,12 +1441,15 @@ fn op_probe() {
                 "/Applications/1Password 7.app".to_string(),
                 "/Applications/1Password.app".to_string(),
             ];
-            eprintln!("\n── file-read-data ───────────────────────────────────");
-            for path in &read_paths {
-                let op = std::ffi::CString::new("file-read-data").unwrap();
-                let p = std::ffi::CString::new(path.as_str()).unwrap();
-                let r = unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 1, p.as_ptr()) };
-                eprintln!("  {} {path}", if r == 0 { "ALLOW" } else { "DENY " });
+            for op_name in &["file-read-data", "file-read-metadata"] {
+                eprintln!("\n── {op_name} ───────────────────────────────────");
+                for path in &read_paths {
+                    let op = std::ffi::CString::new(*op_name).unwrap();
+                    let p = std::ffi::CString::new(path.as_str()).unwrap();
+                    let r =
+                        unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 1, p.as_ptr()) };
+                    eprintln!("  {} {path}", if r == 0 { "ALLOW" } else { "DENY " });
+                }
             }
 
             // ── file-write-data probe ─────────────────────────────────────────
@@ -1487,5 +1514,133 @@ fn op_probe() {
         nix::unistd::ForkResult::Parent { child } => {
             nix::sys::wait::waitpid(child, None).expect("waitpid failed");
         }
+    }
+}
+
+/// Diagnose why `op` can't reach the 1Password desktop app at the system level
+/// (no sandbox involved). Checks process state, socket existence, connectivity,
+/// and op auth/config before trying an actual item fetch.
+///
+/// Run with: cargo test -- --test-threads=1 --ignored --nocapture op_desktop_probe
+#[test]
+#[ignore]
+fn op_desktop_probe() {
+    use std::os::unix::net::UnixStream;
+
+    let home = std::env::var("HOME").unwrap();
+
+    // ── 1. Is 1Password.app running? ─────────────────────────────────────────
+    eprintln!("\n── 1Password process check ──────────────────────────────────");
+    for app in &["1Password", "1Password 7"] {
+        let out = std::process::Command::new("pgrep")
+            .args(["-x", app])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                eprintln!(
+                    "  RUNNING  {app} (pid {})",
+                    String::from_utf8_lossy(&o.stdout).trim()
+                );
+            }
+            Ok(_) => eprintln!("  NOT RUNNING  {app}"),
+            Err(e) => eprintln!("  pgrep failed: {e}"),
+        }
+    }
+
+    // ── 2. Socket inventory ───────────────────────────────────────────────────
+    eprintln!("\n── socket inventory ─────────────────────────────────────────");
+    let gc = format!("{home}/Library/Group Containers");
+    if let Ok(entries) = std::fs::read_dir(&gc) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.contains("1password") || name.contains("agilebits") {
+                let t = entry.path().join("t");
+                eprintln!("  container: {}", entry.path().display());
+                if let Ok(subs) = std::fs::read_dir(&t) {
+                    for sub in subs.flatten() {
+                        let meta = sub.metadata().ok();
+                        let kind = meta
+                            .map(|m| {
+                                if m.file_type().is_symlink() {
+                                    "symlink"
+                                } else if m.file_type().is_dir() {
+                                    "dir"
+                                } else {
+                                    "file"
+                                }
+                            })
+                            .unwrap_or("?");
+                        eprintln!("    {kind}  {}", sub.path().display());
+                    }
+                } else {
+                    eprintln!("    (no t/ subdir)");
+                }
+            }
+        }
+    }
+    let daemon_sock = format!("{home}/.config/op/op-daemon.sock");
+    let daemon_exists = std::path::Path::new(&daemon_sock).exists();
+    eprintln!("  op-daemon.sock exists={daemon_exists}  {daemon_sock}");
+
+    // ── 3. Connect to each candidate socket ───────────────────────────────────
+    eprintln!("\n── socket connect ───────────────────────────────────────────");
+    let candidate_socks = [
+        format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/s.sock"),
+        format!("{home}/Library/Group Containers/2BUA8C4S2C.com.agilebits/t/s.sock"),
+        daemon_sock.clone(),
+    ];
+    for sock in &candidate_socks {
+        match UnixStream::connect(sock) {
+            Ok(_) => eprintln!("  CONNECTED  {sock}"),
+            Err(e) => eprintln!("  FAILED     {sock}  ({e})"),
+        }
+    }
+
+    // ── 4. op version + whoami ────────────────────────────────────────────────
+    eprintln!("\n── op version + whoami ──────────────────────────────────────");
+    for args in [vec!["--version"], vec!["whoami"]] {
+        let out = std::process::Command::new("op").args(&args).output();
+        match out {
+            Ok(o) => {
+                eprintln!("  op {}: exit={}", args.join(" "), o.status);
+                eprintln!("    stdout: {}", String::from_utf8_lossy(&o.stdout).trim());
+                eprintln!("    stderr: {}", String::from_utf8_lossy(&o.stderr).trim());
+            }
+            Err(e) => eprintln!("  op {} spawn failed: {e}", args.join(" ")),
+        }
+    }
+
+    // ── 5. op config ─────────────────────────────────────────────────────────
+    eprintln!("\n── op config ────────────────────────────────────────────────");
+    for cfg in &[
+        format!("{home}/.config/op/config"),
+        format!("{home}/.op/config"),
+    ] {
+        match std::fs::read_to_string(cfg) {
+            Ok(s) => eprintln!("  {cfg}:\n{s}"),
+            Err(e) => eprintln!("  {cfg}: {e}"),
+        }
+    }
+
+    // ── 6. Full op item get with debug ────────────────────────────────────────
+    eprintln!("\n── op item get (OP_DEBUG=1) ──────────────────────────────────");
+    let out = std::process::Command::new("op")
+        .args([
+            "item",
+            "get",
+            "ANTHROPIC_API_KEY",
+            "--reveal",
+            "--fields",
+            "credential",
+        ])
+        .env("OP_DEBUG", "1")
+        .output();
+    match out {
+        Ok(o) => {
+            eprintln!("  exit: {}", o.status);
+            eprintln!("  stdout: {}", String::from_utf8_lossy(&o.stdout));
+            eprintln!("  stderr: {}", String::from_utf8_lossy(&o.stderr));
+        }
+        Err(e) => eprintln!("  spawn failed: {e}"),
     }
 }
