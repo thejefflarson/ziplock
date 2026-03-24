@@ -335,11 +335,6 @@ pub fn generate_profile(
 (allow user-preference*)
 (allow system-socket)
 (allow darwin-notification-post)
-;; lsopen is required for Claude Code's OAuth browser launch (login flow).
-;; Residual risk: a prompt injection could open a browser to an attacker URL.
-;; Mitigated by: DNS proxy blocks malware/phishing domains; browser runs in
-;; its own App Sandbox; no capability to write+execute in the same step.
-(allow lsopen)
 ;; Note: /bin/ps and /usr/bin/top are setuid-root binaries — the macOS sandbox blocks
 ;; setuid execution unconditionally regardless of SBPL rules. process-info* (declared
 ;; above in the Process section) still benefits non-setuid tools and Node.js APIs
@@ -1116,12 +1111,12 @@ mod tests {
     }
 
     #[test]
-    fn profile_allows_lsopen_for_auth() {
-        // lsopen is required for Claude Code's OAuth login flow: it opens the browser
-        // to the authentication URL via LaunchServices. Removed in v1.2.0; restored in
-        // v1.3.2 after confirming that the login flow silently breaks without it.
-        // Residual risk (arbitrary app launch via prompt injection) is mitigated by the
-        // DNS proxy blocking malicious domains and browsers running in their own sandbox.
+    fn profile_blocks_lsopen() {
+        // lsopen allows arbitrary app launch via LaunchServices — a sandbox escape vector
+        // if a prompt injection can supply a URL/path. Blocked since v1.3.4.
+        // Trade-off: Claude Code's OAuth browser launch will fail inside the sandbox;
+        // users must authenticate before running ziplock or use --dangerous-allow-network
+        // to bypass and re-authenticate.
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
@@ -1131,8 +1126,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            profile.contains("(allow lsopen)"),
-            "profile must allow lsopen (required for Claude Code OAuth browser launch)"
+            !profile.contains("(allow lsopen)"),
+            "profile must not allow lsopen (sandbox escape risk)"
         );
     }
 

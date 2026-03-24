@@ -112,7 +112,7 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Mach IPC sandbox escape via privileged service (CVE-2018-4280 class) | `mach-lookup` restricted to an explicit ~65-service allowlist; window server, Bluetooth, Siri, iCloud, media, and phone services are unreachable |
 | Exfiltrate data via clipboard | `com.apple.pasteboard.1` is not in the mach allowlist; Claude cannot read or write the system clipboard |
 | Hijack file type handlers via LaunchServices | `com.apple.lsd.modifydb` is not in the mach allowlist; Claude cannot register new app bundles or override file associations |
-| LaunchServices app launch to arbitrary registered apps | Limited by DNS proxy blocking malicious domains; `lsopen` is allowed (required for OAuth login flow) but browser runs in its own App Sandbox |
+| LaunchServices app launch to arbitrary registered apps | `lsopen` is blocked; Claude cannot open the browser or launch any app via LaunchServices |
 
 ### What ziplock does not block
 
@@ -125,7 +125,7 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Read/write `~/Library/Developer` (Xcode DerivedData, CoreSimulator) | Required for xcodebuild to compile and sign Swift/ObjC projects |
 | List `~/Library` directory contents | Deliberate carve-out — `codesign` checks read/write permission on every ancestor directory before signing; `~/Library` must be accessible or xcodebuild signing fails. Reveals which app folders exist in `~/Library`. |
 | Read `~/.ssh` private keys | `~/.ssh` is under `$HOME`, which must be readable for Claude to work |
-| Open browser or other registered app via LaunchServices | `lsopen` is required for Claude Code's OAuth login flow; a prompt injection could open a browser to an attacker-controlled URL, mitigated by the DNS proxy blocking malicious domains |
+| Claude Code OAuth login flow broken inside sandbox | `lsopen` is blocked to prevent arbitrary app launch via LaunchServices. Authenticate before running ziplock, or run `ziplock --dangerous-allow-network` once to re-authenticate, then restart without that flag. |
 | Connect to Docker/Podman/OrbStack socket and issue daemon API calls | Unix domain sockets are broadly allowed (required for mDNS, 1Password, and other IPC). Blocking specific container runtime sockets is impractical as new runtimes add new socket paths. **If you run Docker, Claude can call the Docker API.** |
 | Read `~/.aws`, `~/.config`, `.env`, etc. | Same — Claude needs project file access; no way to distinguish |
 | Exfiltrate to an *uncategorized* domain | DNS filter is Cloudflare's categorization list, not a whitelist |
