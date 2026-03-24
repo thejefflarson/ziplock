@@ -337,6 +337,8 @@ pub fn generate_profile(
     ;; com.apple.security.agent: Security Agent (authorization dialogs, Touch ID prompts)
     ;; com.apple.secd: security event daemon required by Security.framework credential flows
     (global-name "com.1password.1passwordHelper")
+    ;; XPC message channel from op CLI to 1Password Desktop app (app integration)
+    (global-name "com.1password.desktop.sendMessage")
     (global-name "com.agilebits.onepassword7-helper")
     (global-name "com.apple.security.agent")
     (global-name "com.apple.secd"))
