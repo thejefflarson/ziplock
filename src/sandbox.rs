@@ -379,6 +379,7 @@ pub fn generate_profile(
 (allow ipc*)
 (allow user-preference*)
 (allow system-socket)
+(allow sysctl-read)
 (allow darwin-notification-post)
 ;; lsopen: required for `open MyApp.app` (dev workflow: build → kill → install → open)
 ;; and Claude Code's OAuth browser launch. Residual risk: prompt injection could open a
