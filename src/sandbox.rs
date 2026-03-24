@@ -120,6 +120,8 @@ pub fn generate_profile(
     (subpath "/System/Library/OpenSSL")
     (subpath "/System/Library/Sandbox")
     (subpath "/System/Library/AssetsV2")
+    (subpath "/System/Library/Security")
+    (subpath "/System/Library/Keychains")
     (subpath "/Library/Frameworks")
     (subpath "/Library/Developer")
     (subpath "/Library/Apple")
