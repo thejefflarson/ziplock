@@ -40,6 +40,7 @@ pub fn generate_profile(
     allow_paths: &[PathBuf],
     allow_network: bool,
     ssh_agent_dir: Option<&Path>,
+    op_group_container: Option<&Path>,
 ) -> Result<String> {
     let cwd_str = sanitize_sbpl_path(cwd)?;
     let home_str = sanitize_sbpl_path(home)?;
@@ -59,6 +60,13 @@ pub fn generate_profile(
     }
 
     let ssh_agent_rule = if let Some(dir) = ssh_agent_dir {
+        let safe = sanitize_sbpl_path(dir)?;
+        format!("    (subpath \"{safe}\")\n")
+    } else {
+        String::new()
+    };
+
+    let op_group_container_rule = if let Some(dir) = op_group_container {
         let safe = sanitize_sbpl_path(dir)?;
         format!("    (subpath \"{safe}\")\n")
     } else {
@@ -134,7 +142,10 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Developer")
     (subpath "{home_str}/Library/org.swift.swiftpm")
     (subpath "{home_str}/Library/Security")
-{ssh_agent_rule})
+    ;; op CLI config (~/.op/config stores account credentials/service tokens)
+    (subpath "{home_str}/.op")
+    ;; 1Password group container: op CLI reads vault data from here
+{op_group_container_rule}{ssh_agent_rule})
 
 ;; On macOS 11+, /bin, /usr, and /sbin are firmlinks into /System/Volumes/Root.
 ;; The kernel resolves firmlinks before evaluating sandbox subpath rules, so the
@@ -320,7 +331,15 @@ pub fn generate_profile(
     ;; Terminal keyboard input (input method selection, IME services)
     (global-name "com.apple.inputmethodkit.getxpcendpoint")
     (global-name "com.apple.inputmethodkit.launchagent")
-    (global-name "com.apple.inputmethodkit.launcher"))
+    (global-name "com.apple.inputmethodkit.launcher")
+    ;; ── 1Password CLI (op) ───────────────────────────────────────────────
+    ;; Required for `op` to talk to the 1Password Desktop helper process.
+    ;; com.apple.security.agent: Security Agent (authorization dialogs, Touch ID prompts)
+    ;; com.apple.secd: security event daemon required by Security.framework credential flows
+    (global-name "com.1password.1passwordHelper")
+    (global-name "com.agilebits.onepassword7-helper")
+    (global-name "com.apple.security.agent")
+    (global-name "com.apple.secd"))
 (allow mach-register)
 (allow mach-task-name)
 (allow mach-per-user-lookup)
@@ -385,6 +404,21 @@ fn find_op_agent_socket(home: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Find the 1Password group container directory for op CLI read access.
+/// Returns the top-level group container entry (e.g. ~/Library/Group Containers/2BUA8C4S2C.com.agilebits).
+fn find_1password_group_container(home: &Path) -> Option<PathBuf> {
+    let group_containers = home.join("Library/Group Containers");
+    let entries = std::fs::read_dir(&group_containers).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().to_lowercase();
+        if name_str.contains("1password") || name_str.contains("agilebits") {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
 /// Spawn the claude process with sandbox applied via pre_exec.
 pub fn spawn_claude(
     claude_path: &Path,
@@ -397,12 +431,15 @@ pub fn spawn_claude(
 ) -> Result<std::process::Child> {
     // Detect 1Password SSH agent socket for git operations
     let ssh_agent_dir = find_op_agent_socket(home);
+    // Detect 1Password group container for op CLI vault data access
+    let op_group_container = find_1password_group_container(home);
     let profile = generate_profile(
         cwd,
         home,
         allow_paths,
         allow_network,
         ssh_agent_dir.as_deref(),
+        op_group_container.as_deref(),
     )?;
     debug!("SBPL profile:\n{profile}");
 
@@ -529,6 +566,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(profile.contains(r#"(subpath "/Users/test/project")"#));
@@ -543,6 +581,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -559,6 +598,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(profile.contains(r#"(subpath "/System/Library/Frameworks")"#));
@@ -573,6 +613,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -597,6 +638,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(profile.contains(r#"(remote ip "localhost:*")"#));
@@ -610,6 +652,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             true,
+            None,
             None,
         )
         .unwrap();
@@ -634,6 +677,7 @@ mod tests {
             &[dir1, dir2],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(profile.contains(&format!(r#"(subpath "{}")"#, canonical1.display())));
@@ -650,6 +694,7 @@ mod tests {
             )],
             false,
             None,
+            None,
         );
         assert!(result.is_err());
     }
@@ -663,6 +708,7 @@ mod tests {
             &[PathBuf::from("/tmp/evil\n)(allow network-outbound")],
             false,
             None,
+            None,
         );
         assert!(
             result.is_err(),
@@ -675,6 +721,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         );
         assert!(result2.is_err(), "cwd with embedded CR should be rejected");
     }
@@ -686,6 +733,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         );
         assert!(result.is_err());
@@ -705,6 +753,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -720,6 +769,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -740,6 +790,7 @@ mod tests {
             Some(Path::new(
                 "/Users/test/Library/Group Containers/2BUA8C4S2C.com.1password/t",
             )),
+            None,
         )
         .unwrap();
         assert!(
@@ -751,12 +802,39 @@ mod tests {
     }
 
     #[test]
+    fn profile_op_group_container_carveout() {
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+            Some(Path::new(
+                "/Users/test/Library/Group Containers/2BUA8C4S2C.com.agilebits",
+            )),
+        )
+        .unwrap();
+        assert!(
+            profile.contains(
+                r#"(subpath "/Users/test/Library/Group Containers/2BUA8C4S2C.com.agilebits")"#
+            ),
+            "op group container should appear as a file-read carve-out"
+        );
+        // ~/.op config dir should always be present
+        assert!(
+            profile.contains(r#"(subpath "/Users/test/.op")"#),
+            "~/.op should always be readable"
+        );
+    }
+
+    #[test]
     fn profile_allows_standard_unix_paths_after_system_deny() {
         let profile = generate_profile(
             Path::new("/tmp/proj"),
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -791,6 +869,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         // npm lifecycle scripts spawn binaries from Homebrew; both paths must be
@@ -809,6 +888,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -825,6 +905,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -843,6 +924,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -859,6 +941,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -893,6 +976,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -942,6 +1026,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         // The ~/Library deny must cover file-write*, file-clone, and file-link together
@@ -977,6 +1062,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1016,6 +1102,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1057,6 +1144,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1080,6 +1168,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1114,6 +1203,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1138,6 +1228,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1156,6 +1247,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1181,6 +1273,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1201,6 +1294,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1243,6 +1337,7 @@ mod tests {
             Path::new("/Users/test"),
             &[],
             false,
+            None,
             None,
         )
         .unwrap();

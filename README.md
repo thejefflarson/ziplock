@@ -28,6 +28,8 @@ Developer tool carve-outs (read + write unless noted):
 - `~/Library/Security` — read-only; trust settings for codesign
 - `~/Library` directory entry — read + write on the directory itself (not contents); required for codesign ancestor-directory checks
 - `/Library/Developer`, `/Library/Keychains`, `/Library/Security`, system frameworks — read-only
+- `~/Library/Group Containers/<1Password entry>` — read-only; detected at startup; required for `op` CLI vault data access
+- `~/.op` — read-only; `op` CLI config and account credentials
 
 **Layer 2 — DNS-Filtering Proxy:** SOCKS5 + HTTP CONNECT proxies resolve all DNS via DNS-over-HTTPS (DoH) to Cloudflare 1.1.1.3, which blocks known malware and adult content domains. DoH encrypts queries end-to-end, preventing interception. The sandbox forces all traffic through localhost — no bypass possible. Direct connections to public IPs are also blocked.
 
@@ -122,6 +124,8 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 |---|---|
 | Read `~/Library/Keychains` (enumerate credential names) | Deliberate carve-out — required for `gh` and other developer tools |
 | Write `~/Library/Keychains` (create/modify keychain entries) | Deliberate carve-out — Claude Code stores OAuth tokens in the login keychain |
+| Read `~/Library/Group Containers/<1Password>` and `~/.op` | Deliberate carve-out — required for `op` CLI vault access; only the detected 1Password group container subdirectory is granted |
+| `op` CLI can reach `com.1password.1passwordHelper` and `com.apple.security.agent` via Mach IPC | Required for `op` to authenticate to 1Password Desktop; `security.agent` enables Touch ID/password authorization dialogs |
 | Read/write `~/Library/Developer` (Xcode DerivedData, CoreSimulator) | Required for xcodebuild to compile and sign Swift/ObjC projects |
 | List `~/Library` directory contents | Deliberate carve-out — `codesign` checks read/write permission on every ancestor directory before signing; `~/Library` must be accessible or xcodebuild signing fails. Reveals which app folders exist in `~/Library`. |
 | Signal any user-owned process (SIGKILL terminal, editor, etc.) | `signal` is unrestricted for processes owned by the current user — required for `pkill <AppName>` in the build→kill→install→open dev workflow. SBPL has no mechanism to restrict signals by target process name, signal type, or process tree. A prompt injection crafting a `pkill` or `kill` command could kill the user's shell, editor, or other running apps. Cannot affect other users or escalate to root. |
