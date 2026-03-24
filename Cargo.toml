@@ -1,6 +1,6 @@
 [package]
 name = "ziplock"
-version = "1.3.7"
+version = "1.3.9"
 edition = "2024"
 description = "Safe --dangerously-skip-permissions for Claude Code"
 
