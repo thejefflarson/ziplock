@@ -9,63 +9,19 @@
 
 #![cfg(target_os = "macos")]
 
+mod common;
+
 use std::ffi::{CString, c_char, c_int};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
+// Still needed for the cmd.pre_exec closures in claude_version_runs_in_sandbox
+// and claude_responds_in_sandbox, which call sandbox_init directly after fork.
 unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
     fn sandbox_free_error(errorbuf: *mut c_char);
-}
-
-/// Returns true if we're already running inside a sandbox (nested sandbox_init is forbidden).
-/// In that case the calling test should return early rather than fail.
-///
-/// Uses a fork-based probe to avoid applying a sandbox to the calling process as a side effect
-/// (sandbox_init is irreversible, so we must test it in a disposable child).
-fn already_sandboxed() -> bool {
-    std::io::stdout().flush().ok();
-    std::io::stderr().flush().ok();
-
-    match unsafe { nix::unistd::fork() }.expect("fork failed") {
-        nix::unistd::ForkResult::Child => {
-            let profile = c"(version 1)(allow default)";
-            let mut errorbuf: *mut c_char = std::ptr::null_mut();
-            let ret = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
-            if ret != 0 {
-                if !errorbuf.is_null() {
-                    unsafe { sandbox_free_error(errorbuf) };
-                }
-                std::process::exit(1); // nested sandbox detected
-            }
-            std::process::exit(0); // not sandboxed
-        }
-        nix::unistd::ForkResult::Parent { child } => !matches!(
-            nix::sys::wait::waitpid(child, None).expect("waitpid failed"),
-            nix::sys::wait::WaitStatus::Exited(_, 0)
-        ),
-    }
-}
-
-fn apply_sandbox(profile: &str) -> Result<(), String> {
-    let profile_cstr = CString::new(profile).map_err(|e| e.to_string())?;
-    let mut errorbuf: *mut c_char = std::ptr::null_mut();
-    let ret = unsafe { sandbox_init(profile_cstr.as_ptr(), 0, &mut errorbuf) };
-    if ret != 0 {
-        let msg = if !errorbuf.is_null() {
-            let s = unsafe { std::ffi::CStr::from_ptr(errorbuf) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { sandbox_free_error(errorbuf) };
-            s
-        } else {
-            "unknown error".to_string()
-        };
-        return Err(msg);
-    }
-    Ok(())
 }
 
 /// Test: sandboxed process can write inside CWD and $HOME, cannot write to ~/Library or /etc.
@@ -75,7 +31,7 @@ fn apply_sandbox(profile: &str) -> Result<(), String> {
 /// throughout the home directory at startup.
 #[test]
 fn sandboxed_write_cwd_only() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -92,7 +48,7 @@ fn sandboxed_write_cwd_only() {
     let home_clone = home.clone();
     match unsafe { nix::unistd::fork() }.expect("fork failed") {
         nix::unistd::ForkResult::Child => {
-            apply_sandbox(&profile).unwrap_or_else(|e| {
+            common::apply_sandbox(&profile).unwrap_or_else(|e| {
                 eprintln!("sandbox_init failed: {e}");
                 std::process::exit(99);
             });
@@ -141,7 +97,7 @@ fn sandboxed_write_cwd_only() {
 #[test]
 #[ignore]
 fn claude_version_runs_in_sandbox() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -307,7 +263,7 @@ fn claude_responds_in_sandbox() {
 /// Test: sandboxed process can read ~/.ssh but not ~/Library/Keychains.
 #[test]
 fn sandboxed_read_permissions() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -329,7 +285,7 @@ fn sandboxed_read_permissions() {
 
     match unsafe { nix::unistd::fork() }.expect("fork failed") {
         nix::unistd::ForkResult::Child => {
-            apply_sandbox(&profile).unwrap_or_else(|e| {
+            common::apply_sandbox(&profile).unwrap_or_else(|e| {
                 eprintln!("sandbox_init failed: {e}");
                 std::process::exit(99);
             });

@@ -9,22 +9,20 @@ After implementing the initial sandbox profile (ADR 001), running Claude Code in
 
 ## Decisions and Findings
 
-### 1. `mach*` wildcard is not valid SBPL
+### 1. Bare `(allow mach-lookup)` replaced by explicit allowlist
 
-`(allow mach*)` looks like it should allow all Mach IPC operations but is silently ignored by the SBPL compiler. This caused Claude Code's keychain access to fail: auth tokens are stored under the service name `"Claude Code-credentials"` in `~/Library/Keychains/login.keychain-db` and read via Mach IPC to `com.apple.SecurityServer`.
+`(allow mach*)` is valid SBPL and does take effect, but bare `(allow mach-lookup)` exposes every Mach bootstrap service on the system (~500+ on a typical macOS install) as a potential pivot point for sandbox escape. See finding 12 for the full security rationale and the explicit allowlist.
 
-**Fix:** Enumerate mach operations explicitly:
+The initial profile used bare `(allow mach-lookup)` and explicit mach operation rules:
 
 ```sbpl
 (allow mach-lookup)
 (allow mach-register)
-(allow mach-priv-host-port)
-(allow mach-priv-task-port)
 (allow mach-task-name)
 (allow mach-per-user-lookup)
 ```
 
-**Lesson:** SBPL wildcards (`op*`) are not reliably supported. When in doubt, list operations explicitly. Silently ignored rules produce no error, making this class of bug hard to diagnose.
+This was replaced with a scoped `(allow mach-lookup (global-name "...") ...)` allowlist targeting only the ~65 services Claude Code and developer tools actually need.
 
 ### 2. File writes must cover the entire home directory
 

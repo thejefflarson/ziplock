@@ -379,7 +379,6 @@ pub fn generate_profile(
 (allow ipc*)
 (allow user-preference*)
 (allow system-socket)
-(allow sysctl-read)
 (allow darwin-notification-post)
 ;; lsopen: required for `open MyApp.app` (dev workflow: build → kill → install → open)
 ;; and Claude Code's OAuth browser launch. Residual risk: prompt injection could open a
@@ -401,40 +400,30 @@ pub fn generate_profile(
     ))
 }
 
-/// Scan ~/Library/Group Containers/ for a 1Password SSH agent socket.
-/// Returns the directory containing agent.sock (to pass as ssh_agent_dir to generate_profile).
-fn find_op_agent_socket(home: &Path) -> Option<PathBuf> {
-    let group_containers = home.join("Library/Group Containers");
-    let entries = std::fs::read_dir(&group_containers).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy().to_lowercase();
-        if name_str.contains("1password") || name_str.contains("agilebits") {
-            let agent_sock = entry.path().join("t/agent.sock");
-            if agent_sock.exists() {
-                return agent_sock.parent().map(|p| p.to_path_buf());
-            }
-        }
-    }
-    None
-}
-
-/// Find all 1Password group container directories for op CLI read access.
-/// op v2 uses multiple containers (e.g. 2BUA8C4S2C.com.agilebits and 2BUA8C4S2C.com.1password);
-/// all are needed for settings file reads.
-fn find_1password_group_containers(home: &Path) -> Vec<PathBuf> {
+/// Scan ~/Library/Group Containers/ once for all 1Password-related directories.
+/// Returns (ssh_agent_dir, group_container_paths) where ssh_agent_dir is the
+/// directory containing agent.sock (for SSH_AUTH_SOCK) if present.
+fn find_1password_dirs(home: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
     let group_containers = home.join("Library/Group Containers");
     let Ok(entries) = std::fs::read_dir(&group_containers) else {
-        return vec![];
+        return (None, vec![]);
     };
-    entries
-        .flatten()
-        .filter(|e| {
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            name.contains("1password") || name.contains("agilebits")
-        })
-        .map(|e| e.path())
-        .collect()
+    let mut agent_dir = None;
+    let mut containers = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.contains("1password") || name.contains("agilebits") {
+            let path = entry.path();
+            if agent_dir.is_none() {
+                let sock = path.join("t/agent.sock");
+                if sock.exists() {
+                    agent_dir = sock.parent().map(|p| p.to_path_buf());
+                }
+            }
+            containers.push(path);
+        }
+    }
+    (agent_dir, containers)
 }
 
 /// Spawn the claude process with sandbox applied via pre_exec.
@@ -447,10 +436,7 @@ pub fn spawn_claude(
     allow_network: bool,
     ports: &ProxyPorts,
 ) -> Result<std::process::Child> {
-    // Detect 1Password SSH agent socket for git operations
-    let ssh_agent_dir = find_op_agent_socket(home);
-    // Detect all 1Password group containers for op CLI vault data and settings access
-    let op_group_containers = find_1password_group_containers(home);
+    let (ssh_agent_dir, op_group_containers) = find_1password_dirs(home);
     let profile = generate_profile(
         cwd,
         home,

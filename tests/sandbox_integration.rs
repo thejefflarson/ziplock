@@ -8,89 +8,36 @@
 
 #![cfg(target_os = "macos")]
 
+mod common;
+
 use std::ffi::{CString, c_char, c_int};
 use std::path::{Path, PathBuf};
 
 unsafe extern "C" {
-    fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
-    fn sandbox_free_error(errorbuf: *mut c_char);
-    // SANDBOX_FILTER_PATH=3, SANDBOX_CHECK_NO_REPORT=4; vararg is const char* path
+    // Used by sandbox_allows_codesign_in_library to probe specific operations.
+    // SANDBOX_FILTER_PATH=1; vararg is const char* path or service name
     fn sandbox_check(pid: nix::libc::pid_t, operation: *const c_char, op_type: c_int, ...)
     -> c_int;
-}
-
-/// Returns true if we're already running inside a sandbox (nested sandbox_init is forbidden).
-///
-/// Uses a fork-based probe to avoid applying a sandbox to the calling process as a side effect
-/// (sandbox_init is irreversible, so we must test it in a disposable child).
-fn already_sandboxed() -> bool {
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    std::io::stderr().flush().ok();
-
-    match unsafe { nix::unistd::fork() }.expect("fork failed") {
-        nix::unistd::ForkResult::Child => {
-            let profile = c"(version 1)(allow default)";
-            let mut errorbuf: *mut c_char = std::ptr::null_mut();
-            let ret = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errorbuf) };
-            if ret != 0 {
-                if !errorbuf.is_null() {
-                    unsafe { sandbox_free_error(errorbuf) };
-                }
-                std::process::exit(1); // nested sandbox detected
-            }
-            std::process::exit(0); // not sandboxed
-        }
-        nix::unistd::ForkResult::Parent { child } => !matches!(
-            nix::sys::wait::waitpid(child, None).expect("waitpid failed"),
-            nix::sys::wait::WaitStatus::Exited(_, 0)
-        ),
-    }
-}
-
-/// Apply a sandbox profile to the current process (irreversible).
-fn apply_sandbox(profile: &str) -> Result<(), String> {
-    let profile_cstr = CString::new(profile).map_err(|e| e.to_string())?;
-    let mut errorbuf: *mut c_char = std::ptr::null_mut();
-    let ret = unsafe { sandbox_init(profile_cstr.as_ptr(), 0, &mut errorbuf) };
-    if ret != 0 {
-        let msg = if !errorbuf.is_null() {
-            let s = unsafe { std::ffi::CStr::from_ptr(errorbuf) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { sandbox_free_error(errorbuf) };
-            s
-        } else {
-            "unknown error".to_string()
-        };
-        return Err(msg);
-    }
-    Ok(())
 }
 
 /// Run a closure in a forked child process with a sandbox applied.
 /// Returns the child's exit code (0 = success, non-zero = test failure).
 fn run_sandboxed<F: FnOnce()>(profile: &str, test_fn: F) -> i32 {
     use nix::sys::wait::WaitStatus;
-
-    // Flush stdout/stderr before fork to avoid duplicated output
     use std::io::Write;
     std::io::stdout().flush().ok();
     std::io::stderr().flush().ok();
 
     match unsafe { nix::unistd::fork() }.expect("fork failed") {
         nix::unistd::ForkResult::Child => {
-            // In child: apply sandbox, run test, exit
-            if let Err(e) = apply_sandbox(profile) {
+            if let Err(e) = common::apply_sandbox(profile) {
                 eprintln!("sandbox_init failed in child: {e}");
                 std::process::exit(99);
             }
-            // Run the test — if it panics, the child exits non-zero
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test_fn));
             std::process::exit(if result.is_ok() { 0 } else { 1 });
         }
         nix::unistd::ForkResult::Parent { child } => {
-            // In parent: wait for child
             match nix::sys::wait::waitpid(child, None).expect("waitpid failed") {
                 WaitStatus::Exited(_, code) => code,
                 other => {
@@ -104,7 +51,7 @@ fn run_sandboxed<F: FnOnce()>(profile: &str, test_fn: F) -> i32 {
 
 #[test]
 fn sandbox_blocks_writes_outside_allowed_paths() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -143,7 +90,7 @@ fn sandbox_blocks_writes_outside_allowed_paths() {
 
 #[test]
 fn sandbox_allows_reads_to_keychains() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -179,7 +126,7 @@ fn sandbox_allows_reads_to_keychains() {
 
 #[test]
 fn sandbox_allows_reads_to_productivity_creds() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -215,7 +162,7 @@ fn sandbox_allows_reads_to_productivity_creds() {
 
 #[test]
 fn sandbox_allows_framework_reads() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -251,7 +198,7 @@ fn sandbox_allows_framework_reads() {
 
 #[test]
 fn sandbox_allows_reads_to_system_sandbox_profiles() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -301,7 +248,7 @@ fn sandbox_allows_reads_to_system_sandbox_profiles() {
 
 #[test]
 fn sandbox_allows_xcode_developer_dir() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -350,7 +297,7 @@ fn sandbox_allows_xcode_developer_dir() {
 
 #[test]
 fn sandbox_allows_reads_to_system_preferences() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -402,7 +349,7 @@ fn sandbox_allows_reads_to_system_preferences() {
 
 #[test]
 fn sandbox_allows_reads_to_system_assetsv2() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -442,7 +389,7 @@ fn sandbox_allows_reads_to_system_assetsv2() {
 
 #[test]
 fn sandbox_allows_reads_to_system_keychains() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -485,7 +432,7 @@ fn sandbox_allows_reads_to_system_keychains() {
 
 #[test]
 fn sandbox_allows_swift_package_manager() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -541,7 +488,7 @@ fn sandbox_allows_swift_package_manager() {
 #[test]
 #[ignore]
 fn sandbox_allows_cat_and_standard_unix_tools() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -636,7 +583,7 @@ fn sandbox_allows_cat_and_standard_unix_tools() {
 
 #[test]
 fn sandbox_extra_allow_path() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -677,7 +624,7 @@ fn sandbox_extra_allow_path() {
 #[test]
 #[ignore]
 fn sandbox_allows_codesign_ad_hoc() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -736,7 +683,7 @@ fn sandbox_allows_codesign_ad_hoc() {
 #[test]
 #[ignore]
 fn sandbox_allows_xcodebuild_framework_build() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -859,7 +806,7 @@ fn sandbox_allows_xcodebuild_framework_build() {
 #[test]
 #[ignore]
 fn sandbox_allows_codesign_in_library() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         return;
     }
     let home = std::env::var("HOME").unwrap();
@@ -942,7 +889,7 @@ fn sandbox_allows_codesign_in_library() {
 #[test]
 #[ignore]
 fn sandbox_allows_xcodebuild_deriveddata() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -1055,7 +1002,7 @@ fn sandbox_allows_xcodebuild_deriveddata() {
 #[test]
 #[ignore]
 fn sandbox_allows_xcodebuild_test() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -1192,7 +1139,7 @@ fn sandbox_allows_xcodebuild_test() {
 #[test]
 #[ignore]
 fn sandbox_allows_pkill_and_open() {
-    if already_sandboxed() {
+    if common::already_sandboxed() {
         eprintln!("skipping: already running inside a sandbox");
         return;
     }
@@ -1282,365 +1229,4 @@ fn sandbox_allows_pkill_and_open() {
     std::fs::remove_dir_all("/tmp/ZiplockTestApp.app").ok();
 
     assert_eq!(code, 0, "sandbox_allows_pkill_and_open failed");
-}
-
-/// Probe what the sandbox denies when `op` tries to run.
-///
-/// Runs `sandbox_check()` on every path and mach service `op` is likely to need,
-/// then actually spawns `op item get` and captures its output.
-/// Run with: cargo test -- --test-threads=1 --ignored --nocapture op_probe
-#[test]
-#[ignore]
-fn op_probe() {
-    if already_sandboxed() {
-        eprintln!("must run outside ziplock sandbox");
-        return;
-    }
-
-    let home = std::env::var("HOME").unwrap();
-    // Detect all 1Password group containers the same way spawn_claude does.
-    let op_group_containers: Vec<PathBuf> = {
-        let gc = std::path::PathBuf::from(&home).join("Library/Group Containers");
-        std::fs::read_dir(&gc)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|e| {
-                        let n = e.file_name().to_string_lossy().to_lowercase();
-                        n.contains("1password") || n.contains("agilebits")
-                    })
-                    .map(|e| e.path())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    eprintln!("op_group_containers detected: {op_group_containers:?}");
-
-    let profile = ziplock::sandbox::generate_profile(
-        Path::new("/tmp"),
-        Path::new(&home),
-        &[],
-        false,
-        None,
-        &op_group_containers,
-    )
-    .unwrap();
-
-    // ── control: run op BEFORE any sandbox is applied ────────────────────────
-    use std::io::Write as _;
-    eprintln!("\n── op control (before sandbox) ──────────────────────────────");
-    let ctrl = std::process::Command::new("op")
-        .args([
-            "item",
-            "get",
-            "ANTHROPIC_API_KEY",
-            "--reveal",
-            "--fields",
-            "credential",
-        ])
-        .output();
-    match ctrl {
-        Ok(out) => {
-            eprintln!("  exit: {} success={}", out.status, out.status.success());
-            eprintln!("  stdout: {}", String::from_utf8_lossy(&out.stdout));
-            eprintln!("  stderr: {}", String::from_utf8_lossy(&out.stderr));
-        }
-        Err(e) => eprintln!("  spawn failed: {e}"),
-    }
-
-    std::io::stdout().flush().ok();
-    std::io::stderr().flush().ok();
-
-    match unsafe { nix::unistd::fork() }.expect("fork failed") {
-        nix::unistd::ForkResult::Child => {
-            if let Err(e) = apply_sandbox(&profile) {
-                eprintln!("sandbox_init failed: {e}");
-                std::process::exit(99);
-            }
-
-            // ── profile text (look for ~/.op rule) ────────────────────────────
-            eprintln!("\n── profile excerpt (file-read carve-outs) ──────────");
-            for line in profile.lines() {
-                if line.contains(".op") || line.contains("Application Support") {
-                    eprintln!("  {line}");
-                }
-            }
-
-            // ── all mach operations probe (SANDBOX_FILTER_NONE = 0) ──────────
-            eprintln!("\n── mach operations (no filter) ─────────────────────────");
-            let mach_ops_no_filter = [
-                "mach-lookup",
-                "mach-register",
-                "mach-per-user-lookup",
-                "mach-cross-domain-lookup",
-                "mach-priv-host-port",
-                "mach-priv-task-port",
-                "mach-task-name",
-                "mach-kernel-endpoint",
-            ];
-            for op_name in &mach_ops_no_filter {
-                let op_cstr = std::ffi::CString::new(*op_name).unwrap();
-                let r = unsafe { sandbox_check(nix::libc::getpid(), op_cstr.as_ptr(), 0) };
-                eprintln!("  {} {op_name}", if r == 0 { "ALLOW" } else { "DENY " });
-            }
-
-            // ── mach-lookup probe (SANDBOX_FILTER_GLOBAL_NAME = 2) ────────────
-            let mach_services = [
-                "com.1password.1passwordHelper",
-                "com.1password.desktop.sendMessage",
-                "com.1password.browser-support.extension-helper",
-                "com.agilebits.onepassword7",
-                "com.agilebits.onepassword7-helper",
-                "com.apple.security.agent",
-                "com.apple.secd",
-                "com.apple.SecurityServer",
-                "com.apple.cfprefsd.agent",
-                // Native messaging bridge — key service for Desktop App Integration
-                "2BUA8C4S2C.com.1password.browser-helper",
-            ];
-            eprintln!("\n── mach-lookup ──────────────────────────────────────");
-            for svc in &mach_services {
-                let op = std::ffi::CString::new("mach-lookup").unwrap();
-                let name = std::ffi::CString::new(*svc).unwrap();
-                let r =
-                    unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 2, name.as_ptr()) };
-                eprintln!("  {} {svc}", if r == 0 { "ALLOW" } else { "DENY " });
-            }
-
-            // ── file-read-data probe (SANDBOX_FILTER_PATH = 1) ───────────────
-            let read_paths: Vec<String> = vec![
-                "/tmp".to_string(),
-                format!("{home}"),
-                format!("{home}/.ssh"),
-                format!("{home}/.op"),
-                format!("{home}/.op/config"),
-                format!("{home}/Library"),
-                format!("{home}/Library/Group Containers"),
-                op_group_containers
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .next()
-                    .unwrap_or_else(|| format!("{home}/Library/Group Containers/(none)")),
-                format!("{home}/Library/Application Support"),
-                format!("{home}/.config/op"),
-                format!("{home}/.config/op/config"),
-                format!("{home}/.config/op/op-daemon.sock"),
-                format!("{home}/Library/Application Support"),
-                format!("{home}/Library/Application Support/1Password"),
-                format!("{home}/Library/Application Support/com.agilebits.onepassword7"),
-                format!("{home}/Library/Containers"),
-                format!("{home}/Library/Containers/com.agilebits.onepassword7"),
-                format!("{home}/Library/Containers/2BUA8C4S2C.com.agilebits.onepassword7-helper"),
-                format!("{home}/Library/Containers/com.1password.1password-launcher"),
-                // Key sockets: s.sock = op CLI Desktop Integration, agent.sock = SSH agent
-                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password"),
-                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t"),
-                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/s.sock"),
-                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"),
-                format!("{home}/Library/Preferences/com.agilebits.onepassword7.plist"),
-                "/Applications/1Password 7.app".to_string(),
-                "/Applications/1Password.app".to_string(),
-            ];
-            for op_name in &["file-read-data", "file-read-metadata"] {
-                eprintln!("\n── {op_name} ───────────────────────────────────");
-                for path in &read_paths {
-                    let op = std::ffi::CString::new(*op_name).unwrap();
-                    let p = std::ffi::CString::new(path.as_str()).unwrap();
-                    let r =
-                        unsafe { sandbox_check(nix::libc::getpid(), op.as_ptr(), 1, p.as_ptr()) };
-                    eprintln!("  {} {path}", if r == 0 { "ALLOW" } else { "DENY " });
-                }
-            }
-
-            // ── file-write-data probe ─────────────────────────────────────────
-            eprintln!("\n── file-write-data ──────────────────────────────────");
-            let write_paths = [
-                format!("{home}/.config/op"),
-                format!("{home}/.config/op/config"),
-                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password"),
-                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/s.sock"),
-                "/tmp".to_string(),
-            ];
-            for path in &write_paths {
-                let op_str = std::ffi::CString::new("file-write-data").unwrap();
-                let p = std::ffi::CString::new(path.as_str()).unwrap();
-                let r =
-                    unsafe { sandbox_check(nix::libc::getpid(), op_str.as_ptr(), 1, p.as_ptr()) };
-                eprintln!("  {} {path}", if r == 0 { "ALLOW" } else { "DENY " });
-            }
-
-            // ── try connecting directly to s.sock (Desktop Integration socket) ─
-            eprintln!("\n── unix socket connect test ─────────────────────────");
-            use std::os::unix::net::UnixStream;
-            let ssock =
-                format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/s.sock");
-            match UnixStream::connect(&ssock) {
-                Ok(_) => eprintln!("  CONNECTED to {ssock}"),
-                Err(e) => eprintln!("  FAILED to connect to {ssock}: {e}"),
-            }
-            let dsock = format!("{home}/.config/op/op-daemon.sock");
-            match UnixStream::connect(&dsock) {
-                Ok(_) => eprintln!("  CONNECTED to {dsock}"),
-                Err(e) => eprintln!("  FAILED to connect to {dsock}: {e}"),
-            }
-
-            // ── actually run op ───────────────────────────────────────────────
-            eprintln!("\n── op item get output ───────────────────────────────");
-            let result = std::process::Command::new("op")
-                .args([
-                    "item",
-                    "get",
-                    "ANTHROPIC_API_KEY",
-                    "--reveal",
-                    "--fields",
-                    "credential",
-                ])
-                .env("OP_DEBUG", "1")
-                .env("ALL_PROXY", "")
-                .env("HTTPS_PROXY", "")
-                .env("HTTP_PROXY", "")
-                .output();
-            match result {
-                Ok(out) => {
-                    eprintln!("  exit: {}", out.status);
-                    eprintln!("  stdout: {}", String::from_utf8_lossy(&out.stdout));
-                    eprintln!("  stderr: {}", String::from_utf8_lossy(&out.stderr));
-                }
-                Err(e) => eprintln!("  failed to spawn op: {e}"),
-            }
-
-            std::process::exit(0);
-        }
-        nix::unistd::ForkResult::Parent { child } => {
-            nix::sys::wait::waitpid(child, None).expect("waitpid failed");
-        }
-    }
-}
-
-/// Diagnose why `op` can't reach the 1Password desktop app at the system level
-/// (no sandbox involved). Checks process state, socket existence, connectivity,
-/// and op auth/config before trying an actual item fetch.
-///
-/// Run with: cargo test -- --test-threads=1 --ignored --nocapture op_desktop_probe
-#[test]
-#[ignore]
-fn op_desktop_probe() {
-    use std::os::unix::net::UnixStream;
-
-    let home = std::env::var("HOME").unwrap();
-
-    // ── 1. Is 1Password.app running? ─────────────────────────────────────────
-    eprintln!("\n── 1Password process check ──────────────────────────────────");
-    for app in &["1Password", "1Password 7"] {
-        let out = std::process::Command::new("pgrep")
-            .args(["-x", app])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                eprintln!(
-                    "  RUNNING  {app} (pid {})",
-                    String::from_utf8_lossy(&o.stdout).trim()
-                );
-            }
-            Ok(_) => eprintln!("  NOT RUNNING  {app}"),
-            Err(e) => eprintln!("  pgrep failed: {e}"),
-        }
-    }
-
-    // ── 2. Socket inventory ───────────────────────────────────────────────────
-    eprintln!("\n── socket inventory ─────────────────────────────────────────");
-    let gc = format!("{home}/Library/Group Containers");
-    if let Ok(entries) = std::fs::read_dir(&gc) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            if name.contains("1password") || name.contains("agilebits") {
-                let t = entry.path().join("t");
-                eprintln!("  container: {}", entry.path().display());
-                if let Ok(subs) = std::fs::read_dir(&t) {
-                    for sub in subs.flatten() {
-                        let meta = sub.metadata().ok();
-                        let kind = meta
-                            .map(|m| {
-                                if m.file_type().is_symlink() {
-                                    "symlink"
-                                } else if m.file_type().is_dir() {
-                                    "dir"
-                                } else {
-                                    "file"
-                                }
-                            })
-                            .unwrap_or("?");
-                        eprintln!("    {kind}  {}", sub.path().display());
-                    }
-                } else {
-                    eprintln!("    (no t/ subdir)");
-                }
-            }
-        }
-    }
-    let daemon_sock = format!("{home}/.config/op/op-daemon.sock");
-    let daemon_exists = std::path::Path::new(&daemon_sock).exists();
-    eprintln!("  op-daemon.sock exists={daemon_exists}  {daemon_sock}");
-
-    // ── 3. Connect to each candidate socket ───────────────────────────────────
-    eprintln!("\n── socket connect ───────────────────────────────────────────");
-    let candidate_socks = [
-        format!("{home}/Library/Group Containers/2BUA8C4S2C.com.1password/t/s.sock"),
-        format!("{home}/Library/Group Containers/2BUA8C4S2C.com.agilebits/t/s.sock"),
-        daemon_sock.clone(),
-    ];
-    for sock in &candidate_socks {
-        match UnixStream::connect(sock) {
-            Ok(_) => eprintln!("  CONNECTED  {sock}"),
-            Err(e) => eprintln!("  FAILED     {sock}  ({e})"),
-        }
-    }
-
-    // ── 4. op version + whoami ────────────────────────────────────────────────
-    eprintln!("\n── op version + whoami ──────────────────────────────────────");
-    for args in [vec!["--version"], vec!["whoami"]] {
-        let out = std::process::Command::new("op").args(&args).output();
-        match out {
-            Ok(o) => {
-                eprintln!("  op {}: exit={}", args.join(" "), o.status);
-                eprintln!("    stdout: {}", String::from_utf8_lossy(&o.stdout).trim());
-                eprintln!("    stderr: {}", String::from_utf8_lossy(&o.stderr).trim());
-            }
-            Err(e) => eprintln!("  op {} spawn failed: {e}", args.join(" ")),
-        }
-    }
-
-    // ── 5. op config ─────────────────────────────────────────────────────────
-    eprintln!("\n── op config ────────────────────────────────────────────────");
-    for cfg in &[
-        format!("{home}/.config/op/config"),
-        format!("{home}/.op/config"),
-    ] {
-        match std::fs::read_to_string(cfg) {
-            Ok(s) => eprintln!("  {cfg}:\n{s}"),
-            Err(e) => eprintln!("  {cfg}: {e}"),
-        }
-    }
-
-    // ── 6. Full op item get with debug ────────────────────────────────────────
-    eprintln!("\n── op item get (OP_DEBUG=1) ──────────────────────────────────");
-    let out = std::process::Command::new("op")
-        .args([
-            "item",
-            "get",
-            "ANTHROPIC_API_KEY",
-            "--reveal",
-            "--fields",
-            "credential",
-        ])
-        .env("OP_DEBUG", "1")
-        .output();
-    match out {
-        Ok(o) => {
-            eprintln!("  exit: {}", o.status);
-            eprintln!("  stdout: {}", String::from_utf8_lossy(&o.stdout));
-            eprintln!("  stderr: {}", String::from_utf8_lossy(&o.stderr));
-        }
-        Err(e) => eprintln!("  spawn failed: {e}"),
-    }
 }

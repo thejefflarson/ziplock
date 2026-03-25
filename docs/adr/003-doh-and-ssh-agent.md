@@ -28,7 +28,7 @@ The `<TEAM_ID>` component (`2BUA8C4S2C` for current 1Password versions) is not g
 
 ### DNS-over-HTTPS
 
-Switch to `Protocol::Https` via hickory-resolver's `https-ring` feature:
+Switch to `Protocol::Https` via hickory-resolver's `https-aws-lc-rs` feature:
 
 - Connect to `1.1.1.3:443`
 - TLS SNI: `family.cloudflare-dns.com`
@@ -38,7 +38,7 @@ The DoH connection is made from ziplock's own (unsandboxed) process — the sand
 
 **Why not DoT (DNS-over-TLS)?** DoH reuses port 443, which is harder to block selectively and benefits from HTTP/2 multiplexing. The hickory-resolver `https-ring` feature is already pulling in rustls and ring for TLS; DoT would add the same dependencies without meaningful benefit.
 
-**Why `https-ring` over `https-aws-lc-rs`?** Both are functionally equivalent. `ring` has a longer track record on macOS and a smaller dependency footprint.
+**Why `https-aws-lc-rs` over `https-ring`?** Both are functionally equivalent. `aws-lc-rs` is the newer TLS backend and is actively maintained by AWS; `ring` has had slower updates in recent years.
 
 **Root certificates:** The `webpki-roots` feature is also enabled, which provides hickory's rustls TLS stack with Mozilla's bundled root CA set. Without it, rustls has no trust anchors and rejects all server certificates (`UnknownIssuer`). `webpki-roots` is preferred over `rustls-platform-verifier` (macOS Security framework) because it avoids any dependency on system APIs and is unaffected by enterprise MITM certificates that may be installed in the system trust store.
 
@@ -55,7 +55,7 @@ Scan `~/Library/Group Containers/` at startup for any directory whose name conta
 
 **Why only file-read?** The agent socket is a Unix domain socket; file-read permission in the SBPL profile is what allows opening it. Write permission is not needed — the kernel handles socket communication through the `network-outbound (remote unix-socket)` rule already present in the profile.
 
-**What if 1Password is not installed?** `find_op_agent_socket` returns `None`; no rule is added and `SSH_AUTH_SOCK` is left unchanged (inheriting whatever the parent process had).
+**What if 1Password is not installed?** `find_1password_dirs` returns `(None, vec![])`; no rule is added and `SSH_AUTH_SOCK` is left unchanged (inheriting whatever the parent process had).
 
 ## Consequences
 

@@ -93,24 +93,10 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<IpAddr, St
         return resolve_local_mdns(host).await;
     }
 
-    // Retry up to 3 times with short delays — the DoH resolver can fail transiently
-    // on startup before the HTTPS connection to Cloudflare is established.
-    let mut last_err = String::new();
-    let response = 'retry: {
-        for attempt in 0..3u32 {
-            match resolver.lookup_ip(host).await {
-                Ok(r) => break 'retry r,
-                Err(e) => {
-                    last_err = format!("DNS resolution failed for {host}: {e}");
-                    if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt)))
-                            .await;
-                    }
-                }
-            }
-        }
-        return Err(last_err);
-    };
+    let response = resolver
+        .lookup_ip(host)
+        .await
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
 
     if let Some(ip) = response.iter().next() {
         if is_blocked_ip(&ip) {
