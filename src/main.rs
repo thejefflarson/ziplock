@@ -102,6 +102,13 @@ async fn run() -> Result<ExitCode> {
     // Start proxy (unless --dangerous-allow-network)
     let (ports, _shutdown_tx) = if !cli.allow_network {
         let resolver = dns::create_resolver()?;
+        // Warm up the DoH TLS connection to Cloudflare before spawning Claude.
+        // Without this, the first DNS query (e.g. during /login) can fail with a
+        // TLS HandshakeFailure while the HTTPS session to 1.1.1.3 is being established.
+        match resolver.lookup_ip("api.anthropic.com").await {
+            Ok(_) => info!("DoH resolver warmed up"),
+            Err(e) => warn!("DoH warm-up failed (continuing anyway): {e}"),
+        }
         let (ports, shutdown_tx) = proxy::start(resolver).await?;
         info!(
             "proxy started: SOCKS5=127.0.0.1:{}, HTTP=127.0.0.1:{}",
