@@ -4,9 +4,76 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::proxy::ProxyPorts;
+
+/// Minimum Claude Code version that supports `--permission-mode auto`.
+/// Introduced 2026-03-24. https://code.claude.com/docs/en/permission-modes
+const AUTO_MODE_MIN_VERSION: (u32, u32, u32) = (2, 1, 83);
+
+/// Parse a `MAJOR.MINOR.PATCH` prefix from the output of `claude --version`.
+/// Returns `None` if parsing fails.
+fn parse_claude_version(output: &str) -> Option<(u32, u32, u32)> {
+    let first_token = output.split_whitespace().next()?;
+    let mut parts = first_token.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    // Patch may have trailing non-digits (e.g. "83-rc1"); strip them.
+    let patch_raw = parts.next()?;
+    let patch_digits: String = patch_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let patch = patch_digits.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn claude_supports_auto_mode(claude_path: &Path) -> bool {
+    let output = match Command::new(claude_path).arg("--version").output() {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("could not probe claude --version: {e}; falling back to bypassPermissions");
+            return false;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_claude_version(&stdout) {
+        Some(v) => v >= AUTO_MODE_MIN_VERSION,
+        None => {
+            warn!(
+                "could not parse claude --version output: {stdout:?}; falling back to bypassPermissions"
+            );
+            false
+        }
+    }
+}
+
+/// Select the permission flags to pass to Claude Code.
+///
+/// - Auto mode (`--permission-mode auto`) is preferred: a server-side classifier reviews
+///   each action before it runs, rather than blindly executing like bypassPermissions.
+///   `--allow-dangerously-skip-permissions` is added so the user can Shift+Tab to bypass
+///   if their plan doesn't support auto (Pro, Bedrock, Vertex, Foundry).
+/// - If `--no-auto-mode` is set, or claude is older than v2.1.83, we fall back to
+///   `--dangerously-skip-permissions` (the original behavior).
+pub fn permission_args(claude_path: &Path, no_auto_mode: bool) -> Vec<String> {
+    if no_auto_mode {
+        info!("--no-auto-mode set; using --dangerously-skip-permissions");
+        return vec!["--dangerously-skip-permissions".to_string()];
+    }
+    if claude_supports_auto_mode(claude_path) {
+        info!("using --permission-mode auto with bypassPermissions fallback");
+        vec![
+            "--permission-mode".to_string(),
+            "auto".to_string(),
+            "--allow-dangerously-skip-permissions".to_string(),
+        ]
+    } else {
+        info!("claude version below 2.1.83; using --dangerously-skip-permissions");
+        vec!["--dangerously-skip-permissions".to_string()]
+    }
+}
 
 unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
@@ -135,6 +202,7 @@ pub fn generate_profile(
     (subpath "/System/Library/AssetsV2")
     (subpath "/System/Library/Security")
     (subpath "/System/Library/Keychains")
+    (subpath "/System/Library/Fonts")
     (subpath "/Library/Frameworks")
     (subpath "/Library/Developer")
     (subpath "/Library/Apple")
@@ -434,6 +502,7 @@ pub fn spawn_claude(
     claude_args: &[String],
     allow_paths: &[PathBuf],
     allow_network: bool,
+    no_auto_mode: bool,
     ports: &ProxyPorts,
 ) -> Result<std::process::Child> {
     let (ssh_agent_dir, op_group_containers) = find_1password_dirs(home);
@@ -448,7 +517,7 @@ pub fn spawn_claude(
     debug!("SBPL profile:\n{profile}");
 
     let mut cmd = Command::new(claude_path);
-    cmd.arg("--dangerously-skip-permissions");
+    cmd.args(permission_args(claude_path, no_auto_mode));
     cmd.args(claude_args);
     cmd.current_dir(cwd);
 
@@ -511,12 +580,11 @@ pub fn spawn_claude(
     // XBS_DISABLE_SANDBOXED_BUILDS=1 — disables build-phase sandbox-exec (xcodebuild).
     // SWIFTPM_SANDBOX=0 — disables sandboxing in open-source SPM toolchains.
     //
-    // IDEPackageSupportDisableManifestSandbox is NOT set here — it is an NSUserDefaults key
-    // that xcodebuild reads from ~/Library/Preferences/com.apple.dt.Xcode.plist.  There is
-    // no per-process mechanism to override NSUserDefaults without writing that plist, which
-    // would persist beyond ziplock's lifetime and affect Xcode sessions outside the sandbox.
-    // If you run Xcode-managed SPM builds inside ziplock, set this once manually:
-    //   defaults write com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES
+    // For Xcode-managed SPM manifest evaluation, pass the argument-domain NSUserDefaults
+    // override on the xcodebuild command line: `-IDEPackageSupportDisableManifestSandbox=YES`.
+    // This scope is per-invocation only; do NOT recommend `defaults write com.apple.dt.Xcode ...`
+    // — that persists in ~/Library/Preferences and weakens the user's regular Xcode sessions
+    // outside of ziplock.
     cmd.env("XBS_DISABLE_SANDBOXED_BUILDS", "1");
     cmd.env("SWIFTPM_SANDBOX", "0");
 
@@ -561,6 +629,60 @@ pub fn spawn_claude(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn parses_standard_version_output() {
+        assert_eq!(
+            parse_claude_version("2.1.112 (Claude Code)\n"),
+            Some((2, 1, 112))
+        );
+        assert_eq!(parse_claude_version("2.1.83"), Some((2, 1, 83)));
+        assert_eq!(parse_claude_version("10.0.0 extra"), Some((10, 0, 0)));
+    }
+
+    #[test]
+    fn parses_patch_with_suffix() {
+        // Pre-release suffixes on the patch component should be stripped.
+        assert_eq!(
+            parse_claude_version("2.1.90-rc1 (Claude Code)"),
+            Some((2, 1, 90))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_version() {
+        assert_eq!(parse_claude_version(""), None);
+        assert_eq!(parse_claude_version("not-a-version"), None);
+        assert_eq!(parse_claude_version("2.1"), None);
+        assert_eq!(parse_claude_version("2.x.1"), None);
+    }
+
+    #[test]
+    fn version_comparison_against_auto_mode_min() {
+        assert!((2, 1, 83) >= AUTO_MODE_MIN_VERSION);
+        assert!((2, 1, 112) >= AUTO_MODE_MIN_VERSION);
+        assert!((2, 2, 0) >= AUTO_MODE_MIN_VERSION);
+        assert!((3, 0, 0) >= AUTO_MODE_MIN_VERSION);
+        // Below the floor
+        assert!((2, 1, 82) < AUTO_MODE_MIN_VERSION);
+        assert!((2, 0, 999) < AUTO_MODE_MIN_VERSION);
+        assert!((1, 99, 99) < AUTO_MODE_MIN_VERSION);
+    }
+
+    #[test]
+    fn permission_args_respects_no_auto_mode_flag() {
+        // When the user forces no-auto-mode, we don't even probe the binary —
+        // a nonexistent path should still yield the legacy flag.
+        let args = permission_args(Path::new("/nonexistent/claude"), true);
+        assert_eq!(args, vec!["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn permission_args_falls_back_when_probe_fails() {
+        // Nonexistent binary => version probe fails => fall back to bypassPermissions.
+        let args = permission_args(Path::new("/nonexistent/claude"), false);
+        assert_eq!(args, vec!["--dangerously-skip-permissions"]);
+    }
 
     #[test]
     fn profile_contains_cwd_and_home() {

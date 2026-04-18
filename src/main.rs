@@ -31,6 +31,11 @@ struct Cli {
     #[arg(long = "dangerous-allow-network")]
     allow_network: bool,
 
+    /// Force `--dangerously-skip-permissions` instead of `--permission-mode auto`.
+    /// Use this if your plan (Pro, Bedrock, Vertex, Foundry) does not support auto mode.
+    #[arg(long = "no-auto-mode")]
+    no_auto_mode: bool,
+
     /// Show sandbox/proxy activity
     #[arg(short, long)]
     verbose: bool,
@@ -126,6 +131,7 @@ async fn run() -> Result<ExitCode> {
         &cli.claude_args,
         &cli.allow_paths,
         cli.allow_network,
+        cli.no_auto_mode,
         &ports,
     )?;
 

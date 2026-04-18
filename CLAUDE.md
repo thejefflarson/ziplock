@@ -8,6 +8,14 @@ Wraps Claude Code in two OS-level safety layers:
 1. **macOS Seatbelt Sandbox** — restricts writes to CWD, /tmp, and $HOME (excluding ~/Library, except ~/Library/Caches); blocks reads to ~/Library, /Library, /System (with carve-outs for frameworks, ~/Library/Preferences, and ~/Library/Caches)
 2. **DNS-Filtering Proxy** — SOCKS5 + HTTP CONNECT proxy resolving all DNS via DoH (DNS-over-HTTPS) through Cloudflare 1.1.1.3 (blocks malware + adult content)
 
+## Permission mode
+
+Ziplock prefers Claude Code's **auto mode** (`--permission-mode auto`) over `--dangerously-skip-permissions`. Auto mode adds a classifier-reviewed approval layer *inside* Claude Code; ziplock's OS sandbox is the second layer.
+
+- Default: `--permission-mode auto --allow-dangerously-skip-permissions` (starts in auto; user can Shift+Tab to bypass if their plan doesn't support auto)
+- Fallback: Claude Code older than v2.1.83 automatically falls back to `--dangerously-skip-permissions`
+- Opt-out: pass `--no-auto-mode` to force the legacy flag (useful for Pro/Bedrock/Vertex/Foundry plans where auto isn't available)
+
 ## Build & Run
 
 ```bash
@@ -18,6 +26,7 @@ cargo build --release
 ./target/debug/ziplock -- -p "hello"      # pass args to claude
 ./target/debug/ziplock --allow-path /extra/dir   # grant write access to additional path
 ./target/debug/ziplock --dangerous-allow-network              # sandbox only, skip DNS proxy
+./target/debug/ziplock --no-auto-mode                         # force --dangerously-skip-permissions (plans that block auto)
 ```
 
 ## Logs
