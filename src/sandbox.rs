@@ -252,6 +252,10 @@ pub fn generate_profile(
     (subpath "/private/tmp")
     (subpath "/private/var/folders")
     (subpath "/private/var/tmp")
+    ;; Homebrew prefixes: user-owned, required for `brew install/upgrade/uninstall`.
+    ;; /opt/homebrew = Apple Silicon; /usr/local = Intel.
+    (subpath "/opt/homebrew")
+    (subpath "/usr/local")
 {extra_write_rules})
 ;; Block writes/clones/links into the sensitive ~/Library subtree.
 (deny file-write* file-clone file-link
@@ -1005,6 +1009,34 @@ mod tests {
         // allowed for process-exec so node, npm, python, etc. can be spawned.
         assert!(profile.contains(r#"(subpath "/opt/homebrew")"#));
         assert!(profile.contains(r#"(subpath "/usr/local")"#));
+    }
+
+    #[test]
+    fn profile_allows_homebrew_write() {
+        // `brew install/upgrade/uninstall` writes into the Homebrew prefix.
+        // Both prefixes must appear in the file-write* allow block (after the
+        // ~/Library deny, which doesn't apply here anyway).
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+        let write_block = profile
+            .find("(allow file-write* file-clone file-link")
+            .expect("profile must contain a file-write* allow block");
+        let write_block_tail = &profile[write_block..];
+        assert!(
+            write_block_tail.contains(r#"(subpath "/opt/homebrew")"#),
+            "file-write* block must include /opt/homebrew for brew install"
+        );
+        assert!(
+            write_block_tail.contains(r#"(subpath "/usr/local")"#),
+            "file-write* block must include /usr/local for Intel brew install"
+        );
     }
 
     #[test]
