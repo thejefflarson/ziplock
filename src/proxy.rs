@@ -53,20 +53,45 @@ pub async fn start(resolver: Arc<TokioResolver>) -> Result<(ProxyPorts, watch::S
     ))
 }
 
-/// Check if an IP is private/RFC1918/loopback/link-local/reserved.
+/// Check if an IP is private/RFC1918/loopback/link-local/reserved/CGNAT/multicast/broadcast.
 /// Covers all address ranges that should bypass DNS-based SSRF prevention.
+///
+/// IPv6 addresses are first unwrapped if they are IPv4-mapped (`::ffff:a.b.c.d`) — otherwise
+/// an attacker-controlled AAAA record of `::ffff:127.0.0.1` would bypass the v4 classifier
+/// and still reach the embedded IPv4 address when the kernel routes the v6 socket
+/// (macOS defaults `IPV6_V6ONLY=0`).
 pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V4(v4) => is_private_v4(v4),
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_v4(&v4);
+            }
             let s = v6.segments();
             v6.is_loopback()
+                || v6.is_unspecified()
                 || (s[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
                 || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
                 || (s[0] & 0xff00) == 0xff00 // multicast ff00::/8
                 || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
         }
     }
+}
+
+fn is_private_v4(v4: &Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        // CGNAT: 100.64.0.0/10 (RFC 6598)
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 0x40)
+        // Reserved / class E: 240.0.0.0/4
+        || (octets[0] & 0xf0) == 0xf0
+        // "This network": 0.0.0.0/8
+        || octets[0] == 0
 }
 
 /// Check if a resolved IP indicates the domain was blocked (Cloudflare returns 0.0.0.0).
@@ -77,11 +102,14 @@ pub(crate) fn is_blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// Resolve a hostname using our Cloudflare family DNS resolver.
-async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<IpAddr, String> {
+/// Resolve a hostname to a list of safe IPs to try, in connect order.
+/// IPv4 addresses are preferred — networks without an IPv6 default route return
+/// `EHOSTUNREACH` when connecting to AAAA results, so we try v4 first and fall
+/// back to v6.
+async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<Vec<IpAddr>, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_private_ip(&ip) {
-            return Ok(ip);
+            return Ok(vec![ip]);
         }
         return Err(format!("direct public IP connections blocked: {ip}"));
     }
@@ -90,7 +118,7 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<IpAddr, St
     // Use the system resolver (getaddrinfo → mDNSResponder via Unix socket, which the
     // sandbox allows via `network-outbound (remote unix-socket)`).
     if host.ends_with(".local") {
-        return resolve_local_mdns(host).await;
+        return resolve_local_mdns(host).await.map(|ip| vec![ip]);
     }
 
     let response = resolver
@@ -98,19 +126,45 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<IpAddr, St
         .await
         .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
 
-    if let Some(ip) = response.iter().next() {
-        if is_blocked_ip(&ip) {
-            return Err(format!("domain blocked by DNS filter: {host}"));
-        }
-        if is_private_ip(&ip) {
-            return Err(format!(
-                "domain resolved to private IP, blocked: {host} -> {ip}"
-            ));
-        }
-        return Ok(ip);
+    let mut ips: Vec<IpAddr> = response.iter().collect();
+    if ips.is_empty() {
+        return Err(format!("no addresses found for {host}"));
     }
 
-    Err(format!("no addresses found for {host}"))
+    // A single blocked IP (Cloudflare returns 0.0.0.0 for malware/adult) means the whole
+    // domain is blocked; reject without attempting any candidate.
+    if ips.iter().any(is_blocked_ip) {
+        return Err(format!("domain blocked by DNS filter: {host}"));
+    }
+    // If any resolved IP is private/link-local/CGNAT/etc. we must reject the lookup entirely
+    // rather than silently falling back to a public address — otherwise a DNS-rebinding
+    // attacker could mix a public and private answer and steer us to the private one.
+    if let Some(bad) = ips.iter().find(|ip| is_private_ip(ip)) {
+        return Err(format!(
+            "domain resolved to private IP, blocked: {host} -> {bad}"
+        ));
+    }
+
+    // Prefer v4 so boxes without an IPv6 default route don't fail with EHOSTUNREACH.
+    ips.sort_by_key(|ip| if ip.is_ipv4() { 0u8 } else { 1u8 });
+    Ok(ips)
+}
+
+/// Connect to the first IP in the candidate list that accepts a TCP connection.
+async fn connect_any(ips: &[IpAddr], port: u16) -> std::io::Result<TcpStream> {
+    let mut last_err: Option<std::io::Error> = None;
+    for &ip in ips {
+        match TcpStream::connect((ip, port)).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                debug!("connect {ip}:{port} failed: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no candidate IPs")
+    }))
 }
 
 /// Resolve a `.local` mDNS hostname via the system resolver (mDNSResponder).
@@ -194,7 +248,7 @@ async fn handle_socks5(stream: TcpStream, resolver: &TokioResolver) -> Result<()
 
     // Resolve DNS through our filtered resolver
     match resolve_host(resolver, &host).await {
-        Ok(ip) => match TcpStream::connect((ip, port)).await {
+        Ok(ips) => match connect_any(&ips, port).await {
             Ok(mut target_stream) => {
                 let bound = target_stream
                     .local_addr()
@@ -292,7 +346,7 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
         debug!("http CONNECT {host}:{port}");
 
         match resolve_host(resolver, &host).await {
-            Ok(ip) => match TcpStream::connect((ip, port)).await {
+            Ok(ips) => match connect_any(&ips, port).await {
                 Ok(mut target_stream) => {
                     stream
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -331,7 +385,7 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
             debug!("http proxy {method} {host}:{port}");
 
             match resolve_host(resolver, &host).await {
-                Ok(ip) => match TcpStream::connect((ip, port)).await {
+                Ok(ips) => match connect_any(&ips, port).await {
                     Ok(mut target_stream) => {
                         target_stream.write_all(&buf[..total]).await?;
                         tokio::io::copy_bidirectional(&mut stream, &mut target_stream)
@@ -435,6 +489,37 @@ mod tests {
         assert!(!is_private_ip(&IpAddr::V6(
             "2001:4860:4860::8888".parse().unwrap()
         )));
+
+        // IPv4-mapped IPv6 must inherit the v4 classification (SSRF bypass guard).
+        assert!(is_private_ip(&IpAddr::V6(
+            "::ffff:127.0.0.1".parse().unwrap()
+        )));
+        assert!(is_private_ip(&IpAddr::V6(
+            "::ffff:192.168.1.1".parse().unwrap()
+        )));
+        assert!(is_private_ip(&IpAddr::V6(
+            "::ffff:169.254.169.254".parse().unwrap()
+        )));
+        assert!(!is_private_ip(&IpAddr::V6(
+            "::ffff:8.8.8.8".parse().unwrap()
+        )));
+
+        // CGNAT (100.64.0.0/10)
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(
+            100, 127, 255, 254
+        ))));
+        // But 100.128.x is outside CGNAT and public-routable
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+
+        // Multicast, broadcast, reserved class E, "this network"
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::BROADCAST)));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1))));
+
+        // IPv6 unspecified
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
     }
 
     #[test]
