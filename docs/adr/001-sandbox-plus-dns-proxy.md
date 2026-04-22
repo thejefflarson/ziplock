@@ -11,8 +11,8 @@ Claude Code's `--dangerously-skip-permissions` flag enables fully autonomous ope
 ### Two-layer architecture
 
 **Layer 1 — macOS Seatbelt Sandbox (via sandbox_init FFI):**
-- Default deny writes, allow CWD, /tmp, and $HOME (excluding ~/Library)
-- Allow reads everywhere except ~/Library, /Library, /System (with framework carve-outs)
+- Default deny writes, allow CWD, `/private/tmp`, `/private/var/folders`, `/private/var/tmp`, `/opt/homebrew`, `/usr/local`, and `$HOME` excluding `~/Library` (with Caches/Keychains/Developer/org.swift.swiftpm carve-outs)
+- Allow reads everywhere except `~/Library`, `/Library`, `/System` (with framework, Fonts, and developer-tool carve-outs)
 - Force all network through localhost only
 - Applied via `sandbox_init()` FFI in `pre_exec`, not `sandbox-exec`
 
@@ -20,7 +20,9 @@ Claude Code's `--dangerously-skip-permissions` flag enables fully autonomous ope
 - SOCKS5 proxy for `ALL_PROXY=socks5h://` (h = proxy-side DNS)
 - HTTP CONNECT proxy for `HTTP_PROXY`/`HTTPS_PROXY`
 - All DNS resolved via DoH (DNS-over-HTTPS) to Cloudflare 1.1.1.3 — blocks malware + adult content; encrypted to prevent interception (see ADR 003)
-- Raw public IPs blocked; private/RFC1918 IPs allowed
+- Raw public IPs blocked; private/loopback/link-local/CGNAT/multicast/broadcast/class-E (and their IPv4-mapped IPv6 forms) rejected as SSRF
+- Mixed-answer DNS rebinding guard: if any address in the resolved set is private, the whole lookup is refused
+- IPv4 tried before IPv6 so hosts without an IPv6 default route don't fail on AAAA answers
 
 ### Key tradeoffs
 - **Productivity credentials allowed** (~/.ssh, ~/.aws, ~/.gnupg) — blocking them makes Claude unusable for real work

@@ -10,14 +10,19 @@ Ziplock wraps Claude Code in two OS-level safety layers so you can run autonomou
 ziplock
   ├─ SOCKS5 + HTTP CONNECT proxy (localhost)
   │    └─ DNS-over-HTTPS → Cloudflare 1.1.1.3 (blocks malware + adult content)
+  │       Prefers IPv4; rejects private/CGNAT/multicast IPs (and v4-mapped v6)
   │
-  └─ sandbox_init() → claude --dangerously-skip-permissions
-       └─ writes restricted to CWD, /tmp, $HOME (excluding most of ~/Library)
+  └─ sandbox_init() → claude --permission-mode auto --allow-dangerously-skip-permissions
+       └─ writes restricted to CWD, /private/tmp, /private/var/folders, /private/var/tmp,
+          /opt/homebrew, /usr/local, $HOME (most of ~/Library denied)
        └─ reads blocked for ~/Library, /Library, /System (with developer tool carve-outs)
        └─ all network forced through localhost proxy
+       └─ TMPDIR = /tmp/claude.<uid> (mode 0700, ownership-verified)
 ```
 
-**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/tmp`, and `$HOME` (excluding `~/Library`, with carve-outs below). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for developer tooling. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule. Mach IPC (`mach-lookup`) is restricted to an explicit allowlist of ~65 named services — eliminating ~70 irrelevant GUI, media, Bluetooth, Siri, and iCloud services from the reachable attack surface. Two services (`pasteboard.1`, `lsd.modifydb`) are intentionally denied to block clipboard exfiltration and LaunchServices database writes.
+**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/private/tmp`, `/private/var/folders`, `/private/var/tmp`, `/opt/homebrew`, `/usr/local`, and `$HOME` (excluding `~/Library`, with carve-outs below). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for developer tooling and `/System/Library/Fonts`. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule; control characters, `"`, and `\` are rejected to prevent SBPL string-literal escape. TMPDIR is set to a per-uid directory (`/tmp/claude.<uid>`, mode 0700, refused if pre-existing as a symlink or owned by another user). Mach IPC (`mach-lookup`) is restricted to an explicit allowlist of ~80 named services — eliminating ~70 irrelevant GUI, media, Bluetooth, Siri, and iCloud services from the reachable attack surface. Two services (`pasteboard.1`, `lsd.modifydb`) are intentionally denied to block clipboard exfiltration and LaunchServices database writes.
+
+**Permission mode.** On Claude Code ≥ 2.1.83 ziplock launches with `--permission-mode auto --allow-dangerously-skip-permissions`; auto mode's classifier reviews actions inside Claude Code, with `Shift+Tab` as a bypass if a plan doesn't support auto. Older Claude binaries fall back to `--dangerously-skip-permissions`. Pass `--no-auto-mode` to force the legacy flag on plans that disallow auto (Pro, Bedrock, Vertex, Foundry).
 
 Developer tool carve-outs (read + write unless noted):
 - `~/Library/Caches` — build tool caches (Go, npm, pip, Homebrew, Xcode)
@@ -31,7 +36,7 @@ Developer tool carve-outs (read + write unless noted):
 - `~/Library/Group Containers/<1Password entry>` — read-only; detected at startup; required for `op` CLI vault data access
 - `~/.op` — read-only; `op` CLI config and account credentials
 
-**Layer 2 — DNS-Filtering Proxy:** SOCKS5 + HTTP CONNECT proxies resolve all DNS via DNS-over-HTTPS (DoH) to Cloudflare 1.1.1.3, which blocks known malware and adult content domains. DoH encrypts queries end-to-end, preventing interception. The sandbox forces all traffic through localhost — no bypass possible. Direct connections to public IPs are also blocked.
+**Layer 2 — DNS-Filtering Proxy:** SOCKS5 + HTTP CONNECT proxies resolve all DNS via DNS-over-HTTPS (DoH) to Cloudflare 1.1.1.3, which blocks known malware and adult content domains. DoH encrypts queries end-to-end, preventing interception. The sandbox forces all traffic through localhost — no bypass possible. Direct connections to public IPs are blocked; resolved private/loopback/link-local/CGNAT/multicast/broadcast/class-E IPs (and their IPv4-mapped IPv6 forms) are rejected as SSRF. If a single lookup returns a mix of public and private addresses the whole lookup is refused (mixed-answer DNS rebinding). IPv4 is tried before IPv6, so hosts without an IPv6 default route don't fail on AAAA records.
 
 ## Install
 
@@ -54,9 +59,15 @@ ziplock --allow-path /tmp/build-output
 # Skip DNS filtering (filesystem sandbox only)
 ziplock --dangerous-allow-network
 
+# Force --dangerously-skip-permissions instead of --permission-mode auto
+# (for plans that don't support auto: Pro, Bedrock, Vertex, Foundry)
+ziplock --no-auto-mode
+
 # Verbose mode — logs proxy connections, blocked domains
 ziplock -v
 ```
+
+Logs go to `~/.claude/ziplock.log` (mode 0600), rotated to `ziplock.log.old` when they exceed 10 MB.
 
 ## What's protected
 
@@ -91,7 +102,8 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Modify `~/Library` (cookies, app state, Mail, Messages) | Explicit `file-write*` deny on `~/Library` subpath |
 | Persist malware in `~/Library/LaunchAgents` | Covered by `~/Library` write deny |
 | Escape CWD via `--allow-path` symlink | Paths canonicalized before SBPL insertion |
-| SBPL injection via crafted path argument | `"` and `\` rejected; null bytes caught by `CString` |
+| SBPL injection via crafted path argument | `"`, `\`, and control characters (including `\n`/`\r`) rejected; null bytes caught by `CString` |
+| Redirect TMPDIR via prepared `/tmp/claude` symlink | TMPDIR is per-uid (`/tmp/claude.<uid>`), refuses existing symlinks or wrong owner |
 
 #### Network
 
@@ -102,7 +114,10 @@ The adversary is **malicious content in Claude's context** — a prompt injectio
 | Bypass DNS filter via raw public IP | Proxy rejects non-private literal IPs |
 | Bypass proxy entirely (direct outbound TCP) | Sandbox restricts network to `localhost:*` |
 | Intercept or spoof DNS queries | All DNS over DoH (TLS to `family.cloudflare-dns.com`) |
-| DNS rebinding (domain → private IP after allow) | Resolved IP checked against `is_private_ip()` |
+| SSRF to LAN / loopback via crafted A record | Resolved IPv4 checked against RFC1918, loopback, link-local, CGNAT, multicast, broadcast, class E, and "this network" ranges |
+| SSRF via IPv4-mapped IPv6 (`::ffff:a.b.c.d`) | v6 addresses are unwrapped to v4 and re-classified before connect |
+| DNS rebinding via mixed public/private answer | If any resolved IP is private, the whole lookup is rejected |
+| HTTP request smuggling (plain-HTTP proxy path) | Requests carrying both `Content-Length` and `Transfer-Encoding` are refused with 400 |
 
 #### Process and IPC
 

@@ -22,7 +22,7 @@ The initial profile used bare `(allow mach-lookup)` and explicit mach operation 
 (allow mach-per-user-lookup)
 ```
 
-This was replaced with a scoped `(allow mach-lookup (global-name "...") ...)` allowlist targeting only the ~65 services Claude Code and developer tools actually need.
+This was replaced with a scoped `(allow mach-lookup (global-name "...") ...)` allowlist targeting only the ~80 services Claude Code and developer tools actually need.
 
 ### 2. File writes must cover the entire home directory
 
@@ -124,7 +124,13 @@ A formal security review identified four areas where the profile granted more th
 
 **Removed `mach-priv-host-port` and `mach-priv-task-port`:** These grant access to host-level privilege ports — more powerful than the bootstrap service lookup that developer tools actually require. `mach-lookup`, `mach-register`, `mach-task-name`, and `mach-per-user-lookup` are sufficient for keychain, launchd, and XPC service access.
 
-**Removed `lsopen`:** LaunchServices `lsopen` allows invoking any registered application for a file/URL type (browsers, email clients, etc.). This is a weak prompt-injection escalation path — a malicious context could instruct Claude to open a URL, triggering an external app launch. Not required for Claude Code's core operation.
+**`lsopen` — initially removed, later re-added:** The security review's original position was that LaunchServices `lsopen` gives a prompt-injected Claude a weak escalation path (open a URL → browser launches → external navigation). It was removed.
+
+In practice two workflows needed it back:
+- The `open MyApp.app` dev loop (`build → pkill → install → open`) in Swift/macOS projects.
+- Claude Code's own OAuth login flow, which opens a browser to the auth URL.
+
+`lsopen` is allowed again, with the residual risk mitigated by the DNS proxy blocking malicious domains (so "open a URL" can't reach an attacker-controlled host without first surviving Cloudflare family's categorization). Any browser launched inherits its own App Sandbox, independent of ziplock's.
 
 **`sysctl*` → `sysctl-read`:** `sysctl*` covered both reads and writes. Claude Code only needs to query kernel parameters (architecture, OS version, CPU count). `sysctl-read` expresses the actual intent and removes write access, even though sysctl writes generally require root anyway.
 
@@ -195,5 +201,5 @@ Then reproduce the failure and look for the blocked service name. Before adding 
 - The write policy is home-directory-wide (minus ~/Library), which is broader than the original design intended
 - `~/Library/Keychains` is readable and writable; credential names and OAuth tokens are accessible to the sandboxed process
 - `--allow-path` requires the target to exist at launch time; deferred path creation is not supported
-- Mach IPC is restricted to an explicit service allowlist (~65 allowed, ~70 GUI/media/sync services unreachable); two services (`pasteboard.1`, `lsd.modifydb`) are intentional denies that block clipboard access and LaunchServices database writes
+- Mach IPC is restricted to an explicit service allowlist (~80 allowed, ~70 GUI/media/sync services unreachable); two services (`pasteboard.1`, `lsd.modifydb`) are intentional denies that block clipboard access and LaunchServices database writes
 - Log output never reaches the terminal; users must check `~/.claude/ziplock.log` to see proxy/sandbox activity

@@ -36,7 +36,7 @@ Switch to `Protocol::Https` via hickory-resolver's `https-aws-lc-rs` feature:
 
 The DoH connection is made from ziplock's own (unsandboxed) process — the sandboxed claude subprocess only ever speaks to the localhost proxy, so no sandbox rule changes are needed.
 
-**Why not DoT (DNS-over-TLS)?** DoH reuses port 443, which is harder to block selectively and benefits from HTTP/2 multiplexing. The hickory-resolver `https-ring` feature is already pulling in rustls and ring for TLS; DoT would add the same dependencies without meaningful benefit.
+**Why not DoT (DNS-over-TLS)?** DoH reuses port 443, which is harder to block selectively and benefits from HTTP/2 multiplexing. The hickory-resolver `https-aws-lc-rs` feature is already pulling in rustls and aws-lc-rs for TLS; DoT would add the same dependencies without meaningful benefit.
 
 **Why `https-aws-lc-rs` over `https-ring`?** Both are functionally equivalent. `aws-lc-rs` is the newer TLS backend and is actively maintained by AWS; `ring` has had slower updates in recent years.
 
@@ -60,7 +60,7 @@ Scan `~/Library/Group Containers/` at startup for any directory whose name conta
 ## Consequences
 
 - DNS queries are now encrypted and authenticated end-to-end; the malware filter cannot be bypassed by DNS spoofing.
-- Adds `ring`, `rustls`, `tokio-rustls`, and `h2` as transitive dependencies (~12 new crates).
+- Adds `aws-lc-rs`, `rustls`, `tokio-rustls`, `h2`, and `webpki-roots` as transitive dependencies (~12 new crates). `ring` is also present, pulled transitively by `rustls-webpki`.
 - 1Password SSH operations (e.g. `git push` via SSH) work inside the sandbox without user configuration.
 - Other SSH agents (macOS launchd agent, gpg-agent) are unaffected — `SSH_AUTH_SOCK` is only overridden if the 1Password socket is found.
 - The socket scan adds one `read_dir` call at startup; negligible overhead.

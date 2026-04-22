@@ -375,11 +375,19 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
         }
     } else {
         // Plain HTTP proxy: GET http://host/path HTTP/1.1
-        // Security note: the raw request headers are forwarded verbatim, which is a theoretical
-        // CL:TE request smuggling vector if the backend interprets conflicting Content-Length and
-        // Transfer-Encoding headers differently than the client intended. In practice the only
-        // client is Claude Code (a well-behaved HTTP client), so exploitability is very low.
-        // A prompt injection causing Claude to craft smuggled headers is required.
+        //
+        // The raw request headers are forwarded verbatim, so before forwarding
+        // we reject any request that carries both Content-Length and
+        // Transfer-Encoding headers — the CL:TE ambiguity is the canonical
+        // request-smuggling primitive. Real clients (curl, Bun, node) don't
+        // emit both; a request that does is almost certainly crafted.
+        if has_cl_te_conflict(&buf[..total]) {
+            warn!("http proxy rejected request with both Content-Length and Transfer-Encoding");
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
         if let Some(url_host) = extract_host_from_url(target) {
             let (host, port) = parse_host_port(&url_host, 80)?;
             debug!("http proxy {method} {host}:{port}");
@@ -434,6 +442,37 @@ fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
     }
 
     Ok((s.to_string(), default_port))
+}
+
+/// Return true if the raw HTTP header block contains BOTH a `Content-Length` and a
+/// `Transfer-Encoding` header — the classic CL:TE request-smuggling primitive.
+/// Case-insensitive header matching; any non-empty value on either side counts.
+fn has_cl_te_conflict(raw: &[u8]) -> bool {
+    // Only scan header region (through the first \r\n\r\n); body bytes past that
+    // are opaque and shouldn't influence the decision.
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(raw.len());
+    let headers = &raw[..end];
+    let text = match std::str::from_utf8(headers) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut has_cl = false;
+    let mut has_te = false;
+    for line in text.lines().skip(1) {
+        // skip request-line
+        if let Some((name, _value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            if name == "content-length" {
+                has_cl = true;
+            } else if name == "transfer-encoding" {
+                has_te = true;
+            }
+        }
+    }
+    has_cl && has_te
 }
 
 /// Extract host:port from an absolute URL like "http://host:port/path".
@@ -566,6 +605,29 @@ mod tests {
             msg.contains("mDNS lookup failed") || msg.contains("no addresses found"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn cl_te_conflict_detects_both_headers() {
+        let req =
+            b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(has_cl_te_conflict(req));
+
+        // Case-insensitive.
+        let req =
+            b"POST /x HTTP/1.1\r\nHost: x\r\nCONTENT-LENGTH: 5\r\ntransfer-encoding: chunked\r\n\r\n";
+        assert!(has_cl_te_conflict(req));
+
+        // Only one present is fine.
+        let normal_cl = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n";
+        assert!(!has_cl_te_conflict(normal_cl));
+        let normal_te = b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(!has_cl_te_conflict(normal_te));
+
+        // Body bytes after the header terminator don't count.
+        let poisoned_body =
+            b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nTransfer-Encoding: chunked";
+        assert!(!has_cl_te_conflict(poisoned_body));
     }
 
     #[test]

@@ -569,7 +569,19 @@ pub fn spawn_claude(
         ssh_agent_dir.as_deref(),
         &op_group_containers,
     )?;
-    debug!("SBPL profile:\n{profile}");
+    // Log a summary, not the full profile. A debug-level dump of the profile
+    // would write HOME paths, detected 1Password container names, and any
+    // `--allow-path` arguments to ~/.claude/ziplock.log. Mode 0600 limits
+    // exposure, but there's no reason to persist that footprint for users who
+    // enable verbose mode.
+    debug!(
+        allow_paths = allow_paths.len(),
+        allow_network,
+        ssh_agent_present = ssh_agent_dir.is_some(),
+        op_containers = op_group_containers.len(),
+        profile_bytes = profile.len(),
+        "SBPL profile generated"
+    );
 
     let mut cmd = Command::new(claude_path);
     cmd.args(permission_args(claude_path, no_auto_mode));

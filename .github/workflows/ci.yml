@@ -28,8 +28,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+          # Exact-match only: a blanket restore-keys on "${{ runner.os }}-cargo-"
+          # restored stale target/ artifacts from older Cargo.lock hashes, which
+          # previously masked a breaking dependency bump (hickory 0.25 → 0.26)
+          # from tripping cargo build. No fallback now — if Cargo.lock changes,
+          # the cache key changes and we build from scratch.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -53,8 +57,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+          # Exact-match only: a blanket restore-keys on "${{ runner.os }}-cargo-"
+          # restored stale target/ artifacts from older Cargo.lock hashes, which
+          # previously masked a breaking dependency bump (hickory 0.25 → 0.26)
+          # from tripping cargo build. No fallback now — if Cargo.lock changes,
+          # the cache key changes and we build from scratch.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build
         run: cargo build
@@ -82,8 +90,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+          # Exact-match only: a blanket restore-keys on "${{ runner.os }}-cargo-"
+          # restored stale target/ artifacts from older Cargo.lock hashes, which
+          # previously masked a breaking dependency bump (hickory 0.25 → 0.26)
+          # from tripping cargo build. No fallback now — if Cargo.lock changes,
+          # the cache key changes and we build from scratch.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build release binary
         run: cargo build --release

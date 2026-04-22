@@ -5,8 +5,8 @@ Safe `--dangerously-skip-permissions` for Claude Code.
 ## What it does
 
 Wraps Claude Code in two OS-level safety layers:
-1. **macOS Seatbelt Sandbox** — restricts writes to CWD, /tmp, and $HOME (excluding ~/Library, except ~/Library/Caches); blocks reads to ~/Library, /Library, /System (with carve-outs for frameworks, ~/Library/Preferences, and ~/Library/Caches)
-2. **DNS-Filtering Proxy** — SOCKS5 + HTTP CONNECT proxy resolving all DNS via DoH (DNS-over-HTTPS) through Cloudflare 1.1.1.3 (blocks malware + adult content)
+1. **macOS Seatbelt Sandbox** — writes restricted to CWD, `/private/tmp`, `/private/var/folders`, `/private/var/tmp`, Homebrew prefixes (`/opt/homebrew`, `/usr/local`), and `$HOME` excluding `~/Library`. `~/Library` carve-outs cover `Caches`, `Keychains`, `Developer`, and `org.swift.swiftpm`. Reads to `~/Library`, `/Library`, `/System` are denied with carve-outs for system frameworks, `/System/Library/Fonts`, and developer tooling. TMPDIR is set to `/tmp/claude.<uid>` (mode 0700, ownership-verified). Mach IPC is restricted to an explicit allowlist of ~80 services.
+2. **DNS-Filtering Proxy** — SOCKS5 + HTTP CONNECT proxy resolving all DNS via DoH (DNS-over-HTTPS) through Cloudflare 1.1.1.3 (blocks malware + adult content). Private/RFC1918/CGNAT/multicast/broadcast/class-E IPs (and their IPv4-mapped IPv6 forms) are rejected; any resolved set containing a private IP is rejected outright to block mixed-answer DNS rebinding. IPv4 is preferred when both A and AAAA records resolve.
 
 ## Permission mode
 
@@ -31,7 +31,7 @@ cargo build --release
 
 ## Logs
 
-Tracing output goes to `~/.claude/ziplock.log` (never stderr — would corrupt Claude's TUI).
+Tracing output goes to `~/.claude/ziplock.log` (mode 0600; never stderr — would corrupt Claude's TUI). The file is rotated to `ziplock.log.old` when it exceeds 10 MB.
 
 ```bash
 tail -f ~/.claude/ziplock.log
@@ -41,10 +41,12 @@ tail -f ~/.claude/ziplock.log
 
 ```
 src/
-├── main.rs      # CLI parsing (clap), orchestration, signal forwarding
-├── sandbox.rs   # SBPL profile generation, sandbox_init() FFI, 1Password SSH agent detection
+├── main.rs      # CLI parsing (clap), orchestration, signal forwarding, log rotation
+├── sandbox.rs   # SBPL profile generation, sandbox_init() FFI, Claude version probe for
+│                #   auto-mode vs. dangerously-skip-permissions, per-uid TMPDIR, 1Password
+│                #   SSH agent detection
 ├── proxy.rs     # SOCKS5 + HTTP CONNECT proxy with DNS filtering and IP blocking
-└── dns.rs       # Hickory resolver using Cloudflare 1.1.1.3 over DoH (https-ring feature)
+└── dns.rs       # Hickory resolver using Cloudflare 1.1.1.3 over DoH (https-aws-lc-rs feature)
 ```
 
 ## Conventions
