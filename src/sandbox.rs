@@ -499,6 +499,7 @@ fn find_1password_dirs(home: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
 }
 
 /// Spawn the claude process with sandbox applied via pre_exec.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_claude(
     claude_path: &Path,
     cwd: &Path,
