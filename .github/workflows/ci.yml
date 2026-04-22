@@ -60,7 +60,7 @@ jobs:
         run: cargo build
 
       - name: Run unit tests
-        run: cargo test --lib
+        run: cargo test --lib --bins
 
       - name: Run integration tests
         run: cargo test --test proxy_integration --test signal_integration --test sandbox_integration --test e2e_integration

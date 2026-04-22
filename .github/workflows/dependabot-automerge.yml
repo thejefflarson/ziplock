@@ -11,7 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     if: github.actor == 'dependabot[bot]'
     steps:
-      - name: Approve and auto-merge
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Approve and auto-merge (patch-only)
+        # Gate auto-merge on patch bumps only. Minor and major bumps (including
+        # pre-1.0 minor, which Cargo treats as breaking) require manual review.
+        # GitHub Actions versions use a synthetic semver, so digest/exact bumps
+        # land under semver-patch when the tag is a patch.
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch'
         run: |
           gh pr review --approve "$PR_URL"
           gh pr merge --auto --squash "$PR_URL"

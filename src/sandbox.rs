@@ -472,6 +472,56 @@ pub fn generate_profile(
     ))
 }
 
+/// Create `/tmp/claude.<uid>` as TMPDIR with mode 0700 and verify ownership.
+///
+/// A shared `/tmp/claude` is a classic TOCTOU footgun: on a multi-user host,
+/// another user could pre-create it as a symlink and redirect our temp writes.
+/// By tying the directory to the current UID and refusing to proceed if the
+/// existing entry is a symlink or owned by a different user, we eliminate that.
+fn ensure_user_tmpdir() -> Result<PathBuf> {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let path = PathBuf::from(format!("/tmp/claude.{uid}"));
+    prepare_tmpdir(&path, uid)?;
+    Ok(path)
+}
+
+/// Inner half of `ensure_user_tmpdir` that takes explicit inputs so it can be unit-tested.
+fn prepare_tmpdir(path: &Path, expected_uid: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("refusing to use symlinked TMPDIR at {}", path.display());
+            }
+            if !meta.is_dir() {
+                anyhow::bail!("{} exists and is not a directory", path.display());
+            }
+            if meta.uid() != expected_uid {
+                anyhow::bail!(
+                    "{} is owned by uid {} (expected {})",
+                    path.display(),
+                    meta.uid(),
+                    expected_uid
+                );
+            }
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o700 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("failed to chmod 0700 on {}", path.display()))?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+    Ok(())
+}
+
 /// Scan ~/Library/Group Containers/ once for all 1Password-related directories.
 /// Returns (ssh_agent_dir, group_container_paths) where ssh_agent_dir is the
 /// directory containing agent.sock (for SSH_AUTH_SOCK) if present.
@@ -593,12 +643,10 @@ pub fn spawn_claude(
     cmd.env("XBS_DISABLE_SANDBOXED_BUILDS", "1");
     cmd.env("SWIFTPM_SANDBOX", "0");
 
-    // Ensure /tmp/claude exists and set TMPDIR
-    let tmp_claude = PathBuf::from("/tmp/claude");
-    if !tmp_claude.exists() {
-        std::fs::create_dir_all(&tmp_claude).context("failed to create /tmp/claude")?;
-    }
-    cmd.env("TMPDIR", "/tmp/claude");
+    // Per-uid TMPDIR to avoid a shared /tmp/claude that another user on the host
+    // could pre-create as a symlink, redirecting Claude's temp writes elsewhere.
+    let tmp_claude = ensure_user_tmpdir()?;
+    cmd.env("TMPDIR", &tmp_claude);
 
     // Apply sandbox in pre_exec (after fork, before exec)
     let profile_for_closure = profile.clone();
@@ -634,6 +682,76 @@ pub fn spawn_claude(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn prepare_tmpdir_creates_dir_with_0700() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let base =
+            std::env::temp_dir().join(format!("ziplock-test-{}-{}", std::process::id(), uid));
+        let _ = std::fs::remove_dir_all(&base);
+        prepare_tmpdir(&base, uid).unwrap();
+        let meta = std::fs::symlink_metadata(&base).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        assert_eq!(meta.uid(), uid);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prepare_tmpdir_tightens_wide_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let base = std::env::temp_dir().join(format!(
+            "ziplock-test-tighten-{}-{}",
+            std::process::id(),
+            uid
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_tmpdir(&base, uid).unwrap();
+        let mode = std::fs::symlink_metadata(&base)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "wide perms should be tightened to 0700");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prepare_tmpdir_rejects_symlink() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let dir = std::env::temp_dir().join(format!(
+            "ziplock-test-symlink-{}-{}",
+            std::process::id(),
+            uid
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::os::unix::fs::symlink("/tmp", &dir).unwrap();
+        let err = prepare_tmpdir(&dir, uid).unwrap_err().to_string();
+        assert!(err.contains("symlinked"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn prepare_tmpdir_rejects_wrong_owner() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let dir = std::env::temp_dir().join(format!(
+            "ziplock-test-wrong-uid-{}-{}",
+            std::process::id(),
+            uid
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Claim the dir is owned by a different uid than the caller.
+        let bogus = uid.wrapping_add(1);
+        let err = prepare_tmpdir(&dir, bogus).unwrap_err().to_string();
+        assert!(err.contains("owned by uid"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_standard_version_output() {

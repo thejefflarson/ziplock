@@ -16,6 +16,21 @@ fn log_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/ziplock.log"))
 }
 
+/// If `path` exists and exceeds `max_bytes`, rename it to `<path>.old` so the
+/// next open starts a fresh file. Best-effort: errors are swallowed because a
+/// failure here shouldn't prevent ziplock from launching.
+fn rotate_log_if_large(path: &std::path::Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let mut old = path.as_os_str().to_owned();
+    old.push(".old");
+    let _ = std::fs::rename(path, PathBuf::from(old));
+}
+
 #[derive(Parser)]
 #[command(
     name = "ziplock",
@@ -69,6 +84,10 @@ async fn run() -> Result<ExitCode> {
     if let Some(parent) = log_file_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    // Simple size-based rotation: if the log is > 10 MB, rename to `.old` and
+    // start fresh. Keeps one previous file; unbounded growth otherwise fills
+    // the user's disk over long-lived installs.
+    rotate_log_if_large(&log_file_path, 10 * 1024 * 1024);
     // mode 0600: log contains accessed hostnames; must not be world-readable
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -183,5 +202,48 @@ async fn signal_forward(child_pid: Pid) {
             info!("forwarding SIGTERM to claude");
             let _ = signal::kill(child_pid, Signal::SIGTERM);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotate_moves_oversize_log_to_old() {
+        let dir = std::env::temp_dir().join(format!("ziplock-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("ziplock.log");
+        std::fs::write(&log, vec![0u8; 2048]).unwrap();
+        rotate_log_if_large(&log, 1024);
+        assert!(!log.exists(), "original file should have been renamed");
+        let mut rotated = log.as_os_str().to_owned();
+        rotated.push(".old");
+        assert!(
+            std::path::PathBuf::from(rotated).exists(),
+            "rotated .old file should exist"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_leaves_undersize_log_alone() {
+        let dir = std::env::temp_dir().join(format!("ziplock-rotate-small-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("ziplock.log");
+        std::fs::write(&log, b"small").unwrap();
+        rotate_log_if_large(&log, 1024);
+        assert!(log.exists(), "small file should be left in place");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_noop_when_file_missing() {
+        let missing =
+            std::env::temp_dir().join(format!("ziplock-rotate-missing-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        rotate_log_if_large(&missing, 1024);
+        // Should not have created anything
+        assert!(!missing.exists());
     }
 }
