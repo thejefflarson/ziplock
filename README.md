@@ -2,41 +2,7 @@
 
 Safe auto mode for Claude Code.
 
-Ziplock wraps Claude Code in two OS-level safety layers so you can run autonomously without worrying about prompt injection, malware downloads, or accidental `rm -rf /`.
-
-## How it works
-
-```
-ziplock
-  ├─ SOCKS5 + HTTP CONNECT proxy (localhost)
-  │    └─ DNS-over-HTTPS → Cloudflare 1.1.1.3 (blocks malware + adult content)
-  │       Prefers IPv4; rejects private/CGNAT/multicast IPs (and v4-mapped v6)
-  │
-  └─ sandbox_init() → claude --permission-mode auto --allow-dangerously-skip-permissions
-       └─ writes restricted to CWD, /private/tmp, /private/var/folders, /private/var/tmp,
-          /opt/homebrew, /usr/local, $HOME (most of ~/Library denied)
-       └─ reads blocked for ~/Library, /Library, /System (with developer tool carve-outs)
-       └─ all network forced through localhost proxy
-       └─ TMPDIR = /tmp/claude.<uid> (mode 0700, ownership-verified)
-```
-
-**Layer 1 — macOS Seatbelt Sandbox:** Applied via `sandbox_init()` FFI (not `sandbox-exec`). Claude can write to the project directory, `/private/tmp`, `/private/var/folders`, `/private/var/tmp`, `/opt/homebrew`, `/usr/local`, and `$HOME` (excluding `~/Library`, with carve-outs below). The broad home write access is required for Claude Code's LSP plugins (rust-analyzer, typescript, swift) which write throughout `$HOME` at startup. Reads to `~/Library`, `/Library`, and `/System` are blocked, with carve-outs for developer tooling and `/System/Library/Fonts`. Paths passed via `--allow-path` are canonicalized before insertion into the profile, preventing symlink-based bypasses of the `~/Library` deny rule; control characters, `"`, and `\` are rejected to prevent SBPL string-literal escape. TMPDIR is set to a per-uid directory (`/tmp/claude.<uid>`, mode 0700, refused if pre-existing as a symlink or owned by another user). Mach IPC (`mach-lookup`) is restricted to an explicit allowlist of ~80 named services — eliminating ~70 irrelevant GUI, media, Bluetooth, Siri, and iCloud services from the reachable attack surface. Two services (`pasteboard.1`, `lsd.modifydb`) are intentionally denied to block clipboard exfiltration and LaunchServices database writes.
-
-**Permission mode.** On Claude Code ≥ 2.1.83 ziplock launches with `--permission-mode auto --allow-dangerously-skip-permissions`; auto mode's classifier reviews actions inside Claude Code, with `Shift+Tab` as a bypass if a plan doesn't support auto. Older Claude binaries fall back to `--dangerously-skip-permissions`. Pass `--no-auto-mode` to force the legacy flag on plans that disallow auto (Pro, Bedrock, Vertex, Foundry).
-
-Developer tool carve-outs (read + write unless noted):
-- `~/Library/Caches` — build tool caches (Go, npm, pip, Homebrew, Xcode)
-- `~/Library/Keychains` — Claude Code OAuth token storage
-- `~/Library/Developer` — xcodebuild DerivedData, CoreSimulator, archives
-- `~/Library/org.swift.swiftpm` — Swift Package Manager package cache
-- `~/Library/Preferences` — read-only; app preference plists
-- `~/Library/Security` — read-only; trust settings for codesign
-- `~/Library` directory entry — read + write on the directory itself (not contents); required for codesign ancestor-directory checks
-- `/Library/Developer`, `/Library/Keychains`, `/Library/Security`, system frameworks — read-only
-- `~/Library/Group Containers/<1Password entry>` — read-only; detected at startup; required for `op` CLI vault data access
-- `~/.op` — read-only; `op` CLI config and account credentials
-
-**Layer 2 — DNS-Filtering Proxy:** SOCKS5 + HTTP CONNECT proxies resolve all DNS via DNS-over-HTTPS (DoH) to Cloudflare 1.1.1.3, which blocks known malware and adult content domains. DoH encrypts queries end-to-end, preventing interception. The sandbox forces all traffic through localhost — no bypass possible. Direct connections to public IPs are blocked; resolved private/loopback/link-local/CGNAT/multicast/broadcast/class-E IPs (and their IPv4-mapped IPv6 forms) are rejected as SSRF. If a single lookup returns a mix of public and private addresses the whole lookup is refused (mixed-answer DNS rebinding). IPv4 is tried before IPv6, so hosts without an IPv6 default route don't fail on AAAA records.
+Two layers wrap Claude Code: a macOS Seatbelt sandbox (writes restricted to the project plus a few build-tool paths; reads blocked into `~/Library`, `/Library`, `/System` with developer-tool carve-outs) and a localhost-only DNS-over-HTTPS proxy that filters Cloudflare's malware/adult categories and rejects private/CGNAT/multicast IPs as SSRF.
 
 ## Install
 
@@ -47,142 +13,90 @@ cargo install --path .
 ## Usage
 
 ```bash
-# Launch Claude Code in the sandbox
-ziplock
-
-# Pass arguments to Claude
-ziplock -- -p "refactor the auth module"
-
-# Allow writes to additional paths
-ziplock --allow-path /tmp/build-output
-
-# Skip DNS filtering (filesystem sandbox only)
-ziplock --dangerous-allow-network
-
-# Force --dangerously-skip-permissions instead of --permission-mode auto
-# (for plans that don't support auto: Pro, Bedrock, Vertex, Foundry)
-ziplock --no-auto-mode
-
-# Verbose mode — logs proxy connections, blocked domains
-ziplock -v
+ziplock                                    # launch Claude in the sandbox
+ziplock -- -p "refactor the auth module"   # forward args to claude
+ziplock --allow-path /tmp/build-output     # extra writable path
+ziplock --dangerous-allow-network          # filesystem sandbox only, full network
+ziplock --no-auto-mode                     # force --dangerously-skip-permissions
+ziplock -v                                 # verbose
 ```
 
-Logs go to `~/.claude/ziplock.log` (mode 0600), rotated to `ziplock.log.old` when they exceed 10 MB.
+Logs go to `~/.claude/ziplock.log` (mode 0600), rotated to `.old` past 10 MB.
 
-## What's protected
+## How it works
 
-| Attack | Mitigation |
-|--------|------------|
-| Write to system files (`rm -rf /`, `/etc`, `/bin`) | Sandbox blocks writes outside CWD/tmp/$HOME |
-| Modify `~/Library` app data (cookies, Mail, Messages) | `file-write*` deny on `~/Library`; DerivedData/Caches/Keychains are the only write carve-outs |
-| Persist malware in `~/Library/LaunchAgents` | Covered by `~/Library` write deny |
-| Read browser cookies, app secrets, Safari data | Sandbox blocks reads to most of `~/Library`; only developer subtrees are accessible |
-| Download malware | Cloudflare 1.1.1.3 blocks known malware domains |
-| Connect to C2/phishing sites | DNS filter blocks categorized threats |
-| Bypass DNS via direct IP | Proxy blocks all public IP connections |
-| Bypass proxy entirely | Sandbox blocks all non-localhost network |
-| Escape sandbox via child process | Sandbox inherited by all children, cannot be removed |
+```
+ziplock
+  ├─ SOCKS5 + HTTP CONNECT proxy (localhost)
+  │    DoH → Cloudflare 1.1.1.3 (malware + adult content)
+  │    IPv4 preferred; private/CGNAT/multicast/v4-mapped-v6 rejected
+  │
+  └─ sandbox_init() → claude --permission-mode auto --allow-dangerously-skip-permissions
+       writes  → CWD, /private/{tmp,var/folders,var/tmp}, /opt/homebrew, /usr/local,
+                 $HOME (less ~/Library, with carve-outs)
+       reads   → block ~/Library, /Library, /System (dev-tool carve-outs)
+       network → localhost only — all egress forced through the proxy
+       TMPDIR  → /tmp/claude.<uid> (mode 0700, ownership-verified)
+       mach    → ~80-service allowlist; pasteboard.1 and lsd.modifydb denied
+```
+
+**Permission mode.** Claude Code ≥ 2.1.83 runs with `--permission-mode auto --allow-dangerously-skip-permissions`; auto mode's classifier reviews actions, with `Shift+Tab` as a bypass. Older Claude binaries fall back to `--dangerously-skip-permissions`. Pass `--no-auto-mode` to force the legacy flag (Pro/Bedrock/Vertex/Foundry).
+
+**`~/Library` carve-outs:**
+- read+write: `Caches`, `Keychains`, `Developer`, `org.swift.swiftpm`
+- read-only: `Preferences`, `Security`, `Group Containers/<1Password>` (auto-detected)
+- the `~/Library` directory entry itself — `codesign` needs it readable
 
 ## Threat model
 
-Ziplock is effective against **untargeted, opportunistic attacks** — the prompt-injection-downloads-malware class of threat. It provides meaningful friction against **targeted data exfiltration** via novel domains or raw IPs. It provides **no protection** against an adversary who uses allowed domains as exfil channels, who specifically targets in-scope credentials like `~/.ssh` private keys, or who crafts a prompt injection that kills user processes via `pkill`/`kill` (signal permission is unrestricted for user-owned processes — required for the build→kill→install→open dev workflow).
+The adversary is **malicious content in Claude's context** — a prompt injection in a file, a hostile webpage, a compromised tool response. The user is trusted; ziplock protects the user from Claude.
 
-### Attacker model
+### Blocked
 
-The adversary is **malicious content in Claude's context** — a prompt injection in a file Claude reads, a hostile webpage it fetches, or a compromised tool response. The adversary controls what Claude *does*, not what runs on the machine before ziplock starts. The user is trusted; ziplock protects the user from Claude, not Claude from the user.
-
-### What ziplock blocks
-
-#### Filesystem
-
-| Attack | Blocked by |
+| Attack | Mitigation |
 |---|---|
-| Overwrite system files (`/etc`, `/bin`, `/usr`) | Seatbelt `file-write*` deny default |
-| Corrupt other users' home dirs | Seatbelt write restricted to `$HOME` |
-| Modify `~/Library` (cookies, app state, Mail, Messages) | Explicit `file-write*` deny on `~/Library` subpath |
-| Persist malware in `~/Library/LaunchAgents` | Covered by `~/Library` write deny |
-| Escape CWD via `--allow-path` symlink | Paths canonicalized before SBPL insertion |
-| SBPL injection via crafted path argument | `"`, `\`, and control characters (including `\n`/`\r`) rejected; null bytes caught by `CString` |
-| Redirect TMPDIR via prepared `/tmp/claude` symlink | TMPDIR is per-uid (`/tmp/claude.<uid>`), refuses existing symlinks or wrong owner |
+| Overwrite system files / persist in `~/Library/LaunchAgents` | `file-write*` deny default + `~/Library` deny |
+| Read browser cookies, Safari, Mail, Messages | `~/Library` read deny (only dev subtrees carved out) |
+| Bypass DNS filter via raw IP | Proxy rejects literal public IPs |
+| Bypass proxy via direct TCP | Sandbox restricts network to `localhost:*` |
+| DNS spoofing / interception | DoH (TLS to `family.cloudflare-dns.com`) |
+| SSRF to LAN/loopback (incl. v4-mapped v6, CGNAT, multicast, broadcast, class-E) | Proxy reclassifies and rejects before connect |
+| DNS rebinding via mixed public+private answer | Whole lookup rejected if any address is private |
+| Mach IPC sandbox escape (CVE-2018-4280 class) | ~80-service allowlist; GUI/Bluetooth/Siri/iCloud unreachable |
+| Clipboard exfiltration / file-type handler hijack | `pasteboard.1`, `lsd.modifydb` not in allowlist |
+| `--allow-path` symlink escape / SBPL injection | Paths canonicalized; `"`, `\`, control chars rejected |
+| `/tmp/claude` symlink redirect | Per-uid TMPDIR with ownership/symlink check |
+| HTTP request smuggling (CL:TE) | Conflicting `Content-Length`+`Transfer-Encoding` refused |
+| Escape sandbox via child process | Inherited across `exec`; cannot be removed |
 
-#### Network
+### Not blocked (accepted trade-offs)
 
-| Attack | Blocked by |
-|---|---|
-| Download/execute malware from known C2 domain | Cloudflare 1.1.1.3 returns `0.0.0.0` |
-| Connect to known phishing/malware IP via domain | DNS filter |
-| Bypass DNS filter via raw public IP | Proxy rejects non-private literal IPs |
-| Bypass proxy entirely (direct outbound TCP) | Sandbox restricts network to `localhost:*` |
-| Intercept or spoof DNS queries | All DNS over DoH (TLS to `family.cloudflare-dns.com`) |
-| SSRF to LAN / loopback via crafted A record | Resolved IPv4 checked against RFC1918, loopback, link-local, CGNAT, multicast, broadcast, class E, and "this network" ranges |
-| SSRF via IPv4-mapped IPv6 (`::ffff:a.b.c.d`) | v6 addresses are unwrapped to v4 and re-classified before connect |
-| DNS rebinding via mixed public/private answer | If any resolved IP is private, the whole lookup is rejected |
-| HTTP request smuggling (plain-HTTP proxy path) | Requests carrying both `Content-Length` and `Transfer-Encoding` are refused with 400 |
+- **Project file reads** — `~/.ssh`, `~/.aws`, `.env`, anything under `$HOME` outside `~/Library`. Distinguishing them from legitimate project access isn't feasible.
+- **Keychain reads and writes** — required for Claude Code's own OAuth flow. `com.apple.SecurityServer` is in the mach allowlist, so secret *values* are accessible, not just names. Don't run with credentials you wouldn't trust the model with.
+- **`signal` to user-owned processes** — required for `pkill <AppName>` in the build → kill → install → open dev loop. A prompt injection could SIGKILL your shell or editor. Cannot affect other users or escalate to root.
+- **`lsopen`** — required for `open MyApp.app` and OAuth browser launch. The launched app runs under its own App Sandbox; whatever URL it points to passes through the DNS filter.
+- **Docker/Podman/OrbStack daemon socket** — Unix sockets are broadly allowed for IPC. If you run a container daemon, Claude can call its API.
+- **Exfiltration via uncategorized or legitimate domains** (`github.com`, `pastebin.com`, freshly registered hosts) — Cloudflare's filter is categorization-based, not an allowlist.
 
-#### Process and IPC
+### Known incompatibilities
 
-| Attack | Blocked by |
-|---|---|
-| Spawn unsandboxed child process | Sandbox inherited across `exec` |
-| Remove sandbox from a child process | Seatbelt cannot be removed once applied |
-| Signal arbitrary other processes | Not blocked — see accepted trade-offs |
-| Mach IPC sandbox escape via privileged service (CVE-2018-4280 class) | `mach-lookup` restricted to an explicit ~65-service allowlist; window server, Bluetooth, Siri, iCloud, media, and phone services are unreachable |
-| Exfiltrate data via clipboard | `com.apple.pasteboard.1` is not in the mach allowlist; Claude cannot read or write the system clipboard |
-| Hijack file type handlers via LaunchServices | `com.apple.lsd.modifydb` is not in the mach allowlist; Claude cannot register new app bundles or override file associations |
-| LaunchServices app launch to arbitrary registered apps | Limited by DNS proxy blocking malicious domains; `lsopen` is allowed (required for `open MyApp.app` dev workflow and OAuth login) but browser runs in its own App Sandbox |
-
-### What ziplock does not block
-
-#### Accepted trade-offs
-
-| Attack | Why not blocked |
-|---|---|
-| Read `~/Library/Keychains` (enumerate credential names) | Deliberate carve-out — required for `gh` and other developer tools |
-| Write `~/Library/Keychains` (create/modify keychain entries) | Deliberate carve-out — Claude Code stores OAuth tokens in the login keychain |
-| Read `~/Library/Group Containers/<1Password>` and `~/.op` | Deliberate carve-out — required for `op` CLI vault access; only the detected 1Password group container subdirectory is granted |
-| `op` CLI can reach `com.1password.1passwordHelper` and `com.apple.security.agent` via Mach IPC | Required for `op` to authenticate to 1Password Desktop; `security.agent` enables Touch ID/password authorization dialogs |
-| Read/write `~/Library/Developer` (Xcode DerivedData, CoreSimulator) | Required for xcodebuild to compile and sign Swift/ObjC projects |
-| List `~/Library` directory contents | Deliberate carve-out — `codesign` checks read/write permission on every ancestor directory before signing; `~/Library` must be accessible or xcodebuild signing fails. Reveals which app folders exist in `~/Library`. |
-| Signal any user-owned process (SIGKILL terminal, editor, etc.) | `signal` is unrestricted for processes owned by the current user — required for `pkill <AppName>` in the build→kill→install→open dev workflow. SBPL has no mechanism to restrict signals by target process name, signal type, or process tree. A prompt injection crafting a `pkill` or `kill` command could kill the user's shell, editor, or other running apps. Cannot affect other users or escalate to root. |
-| Read `~/.ssh` private keys | `~/.ssh` is under `$HOME`, which must be readable for Claude to work |
-| Open browser or other registered app via LaunchServices | `lsopen` is required for Claude Code's OAuth login flow and `open MyApp.app`; a prompt injection could open a browser to an attacker-controlled URL, mitigated by the DNS proxy blocking malicious domains |
-| Connect to Docker/Podman/OrbStack socket and issue daemon API calls | Unix domain sockets are broadly allowed (required for mDNS, 1Password, and other IPC). Blocking specific container runtime sockets is impractical as new runtimes add new socket paths. **If you run Docker, Claude can call the Docker API.** |
-| Read `~/.aws`, `~/.config`, `.env`, etc. | Same — Claude needs project file access; no way to distinguish |
-| Exfiltrate to an *uncategorized* domain | DNS filter is Cloudflare's categorization list, not a whitelist |
-| Exfiltrate via allowed domains (`github.com`, `pastebin.com`) | Legitimate domains are unblocked by design |
-| Write anywhere in `$HOME` outside `~/Library` | Required for LSP plugins and build tools at startup |
-| SPM and xcodebuild nested sandboxing bypassed | `XBS_DISABLE_SANDBOXED_BUILDS=1` and `SWIFTPM_SANDBOX=0` are set as environment variables, disabling nested sandbox-exec calls that would fail inside ziplock's SBPL profile. ziplock's sandbox still constrains all child processes. For Xcode-managed `Package.swift` manifest evaluation, add `-IDEPackageSupportDisableManifestSandbox=YES` to the `xcodebuild` command line (per-invocation override; does not affect Xcode sessions outside ziplock). |
-| App-hosted `xcodebuild test` targets (tests with a `TEST_HOST`) not supported | When xcodebuild runs inside ziplock's sandbox, `launchservicesd` drops the *entire* environment dictionary the caller passes for the target app launch and reconstructs a fresh env from the user session (Apple security mitigation — sandboxed callers cannot inject env into spawned apps). The test host app launches with no `XCTestSessionIdentifier`, no `XCTestConfigurationFilePath`, and no `DYLD_INSERT_LIBRARIES`, so the XCTest session never pairs with `testmanagerd` and `xcodebuild test` hangs indefinitely after "Testing started". Symptom in `log stream`: `testmanagerd` creates an `XCIDESession` on a socket, waits to pair with a specific session ID, then tears down 30s later with "Unpaired test sessions". Tests with no `TEST_HOST` work fine because `xctest` is `posix_spawn`ed directly and inherits env normally. Workaround: run `xcodebuild test` for app-hosted targets outside ziplock, or restructure to use a library-style test bundle. |
-
-#### The keychain nuance
-
-`~/Library/Keychains` is read **and write** accessible. Reads allow Claude Code to retrieve OAuth tokens via the Security framework. Writes allow Claude Code to store OAuth tokens in the login keychain — without this, re-authentication after sandbox profile changes would be broken. This means Claude can create new keychain entries or modify existing ones. Users who need stricter credential isolation should not run tools requiring keychain auth within Claude's scope.
-
-Reading a keychain item's *value* also requires `SecItemCopyMatching`, which communicates with `com.apple.SecurityServer` via Mach IPC. `com.apple.SecurityServer` is in the `mach-lookup` allowlist (required for Claude Code's own OAuth token access), so this call succeeds. **Ziplock does not prevent Claude from reading keychain secret values.**
-
-#### DNS filter limitations
-
-- **Uncategorized domains:** A freshly registered exfiltration domain that Cloudflare hasn't categorized will resolve normally.
-- **Steganographic exfiltration:** Data encoded in DNS query names (`data.attacker.com`) passes through to Cloudflare; query content is not inspected.
-- **Allowed domains as exfil channels:** Claude can POST to `github.com`, `pastebin.com`, etc. — all legitimate, all unblocked.
+- **App-hosted `xcodebuild test`** (any target with `TEST_HOST`) hangs at "Testing started". `launchservicesd` drops the entire env dict for sandboxed callers, so the test host launches without `XCTestSessionIdentifier` and never pairs with `testmanagerd`. Run app-hosted tests outside ziplock or restructure to a library-style test bundle.
+- **Xcode-managed SPM manifest evaluation** — pass `-IDEPackageSupportDisableManifestSandbox=YES` on the `xcodebuild` command line. SPM's nested sandbox-exec is already disabled via env (`XBS_DISABLE_SANDBOXED_BUILDS=1`, `SWIFTPM_SANDBOX=0`).
 
 ## Comparison
 
 | | Ziplock | Anthropic sandbox-runtime | Claude Code `/sandbox` | Docker Sandboxes | cco |
 |---|---|---|---|---|---|
-| **Isolation mechanism** | macOS Seatbelt (sandbox_init FFI) | Seatbelt (sandbox-exec) / bubblewrap | Seatbelt / bubblewrap | MicroVM (hypervisor) | sandbox-exec / bubblewrap / Docker |
-| **Sandbox applied by** | ziplock before exec | Claude Code itself | Claude Code itself | Docker daemon | shell wrapper |
-| **Escape hatch** | None | No | Yes — Claude can retry with `dangerouslyDisableSandbox` | No | No |
-| **DNS malware filtering** | Yes (Cloudflare 1.1.1.3 DoH) | No | No | No | No |
-| **Direct IP blocking** | Yes (public IPs blocked) | No | No | Configurable | No |
-| **Network policy** | Localhost-only + filtered proxy | Domain allowlist (user-confirmed) | Domain allowlist (user-confirmed) | Allow/deny lists | On/off |
-| **Single binary** | Yes (Rust) | No (npm/Node.js) | Built-in | No (Docker daemon) | No (shell + deps) |
-| **macOS support** | Yes | Yes | Yes | Yes | Yes |
-| **Linux support** | No | Yes (bubblewrap) | Yes (bubblewrap) | Yes | Yes |
+| **Isolation** | Seatbelt (sandbox_init FFI) | Seatbelt / bubblewrap | Seatbelt / bubblewrap | MicroVM | sandbox-exec / bubblewrap / Docker |
+| **Escape hatch** | None | No | Yes (`dangerouslyDisableSandbox`) | No | No |
+| **DNS malware filter** | Yes (Cloudflare DoH) | No | No | No | No |
+| **Direct IP block** | Yes | No | No | Configurable | No |
+| **Network policy** | Localhost-only + filtered proxy | Domain allowlist | Domain allowlist | Allow/deny lists | On/off |
+| **Single binary** | Yes (Rust) | No (Node) | Built-in | No (Docker) | No (shell) |
+| **Linux** | No | Yes | Yes | Yes | Yes |
 | **VM-level isolation** | No | No | No | Yes | No |
-| **Child process inheritance** | Yes (kernel-enforced) | Yes | Yes | Yes | Yes |
 
-The main tradeoffs: Docker Sandboxes offers stronger isolation (hypervisor boundary) but requires Docker Desktop and has startup latency. Anthropic's official `/sandbox` is built-in but has an escape hatch. Ziplock is the only option with DNS-level malware filtering.
+Trade-offs: Docker offers stronger isolation but needs Docker Desktop and startup latency. Anthropic's `/sandbox` is built-in but has an escape hatch. Ziplock is the only option with DNS-level malware filtering.
 
 ## Requirements
 
