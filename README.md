@@ -1,6 +1,6 @@
 # Ziplock
 
-Safe `--dangerously-skip-permissions` for Claude Code.
+Safe auto mode for Claude Code.
 
 Ziplock wraps Claude Code in two OS-level safety layers so you can run autonomously without worrying about prompt injection, malware downloads, or accidental `rm -rf /`.
 
