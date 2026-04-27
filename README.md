@@ -2,7 +2,7 @@
 
 Safe auto mode for Claude Code.
 
-Ziplock makes auto mode safe to leave running. Even if a prompt injection slips past auto mode's classifier, the OS stops Claude from writing outside your project, reading browser cookies or app data in `~/Library`, or reaching known malware and phishing domains.
+Ziplock makes auto mode safer. It stops Claude from writing outside your project, reading browser cookies, and a sidecar proxy stops it from reaching known malware and phishing domains.
 
 ## Install
 
