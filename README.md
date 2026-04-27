@@ -2,7 +2,7 @@
 
 Safe auto mode for Claude Code.
 
-Two layers wrap Claude Code: a macOS Seatbelt sandbox (writes restricted to the project plus a few build-tool paths; reads blocked into `~/Library`, `/Library`, `/System` with developer-tool carve-outs) and a localhost-only DNS-over-HTTPS proxy that filters Cloudflare's malware/adult categories and rejects private/CGNAT/multicast IPs as SSRF.
+Ziplock makes auto mode safe to leave running. Even if a prompt injection slips past auto mode's classifier, the OS stops Claude from writing outside your project, reading browser cookies or app data in `~/Library`, or reaching known malware and phishing domains.
 
 ## Install
 
