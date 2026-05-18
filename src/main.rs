@@ -10,19 +10,35 @@ use nix::unistd::Pid;
 use tracing::{info, warn};
 
 /// Default log file location: ~/.claude/ziplock.log
+///
+/// Validates that HOME does not contain `..` components that would place the log file
+/// outside the expected directory (path traversal via a crafted HOME env var).
 fn log_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".claude").join("ziplock.log"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/ziplock.log"))
+    if let Some(h) = std::env::var_os("HOME") {
+        let base = PathBuf::from(&h);
+        // Reject HOME values containing parent-directory components.
+        if base.components().any(|c| c == std::path::Component::ParentDir) {
+            return PathBuf::from("/tmp/ziplock.log");
+        }
+        base.join(".claude").join("ziplock.log")
+    } else {
+        PathBuf::from("/tmp/ziplock.log")
+    }
 }
 
 /// If `path` exists and exceeds `max_bytes`, rename it to `<path>.old` so the
 /// next open starts a fresh file. Best-effort: errors are swallowed because a
 /// failure here shouldn't prevent ziplock from launching.
 fn rotate_log_if_large(path: &std::path::Path, max_bytes: u64) {
-    let Ok(meta) = std::fs::metadata(path) else {
+    // Use symlink_metadata (lstat) so a symlink at the log path doesn't let an attacker
+    // redirect the rename() to an arbitrary file (TOCTOU: stat-then-rename).
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };
+    // Refuse to rename a symlink — that would atomically redirect the .old target.
+    if meta.file_type().is_symlink() {
+        return;
+    }
     if meta.len() <= max_bytes {
         return;
     }
@@ -82,13 +98,29 @@ async fn run() -> Result<ExitCode> {
     // Set up tracing — write to a file so we don't corrupt Claude's TUI on stderr
     let log_file_path = log_path();
     if let Some(parent) = log_file_path.parent() {
+        // Create ~/.claude with mode 0700 so other local users cannot observe log
+        // file existence or sizes. create_dir_all respects umask (typically 0755)
+        // which would leave the directory world-listable; use DirBuilder for explicit mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .ok();
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(parent).ok();
     }
     // Simple size-based rotation: if the log is > 10 MB, rename to `.old` and
     // start fresh. Keeps one previous file; unbounded growth otherwise fills
     // the user's disk over long-lived installs.
     rotate_log_if_large(&log_file_path, 10 * 1024 * 1024);
-    // mode 0600: log contains accessed hostnames; must not be world-readable
+    // mode 0600: log contains accessed hostnames; must not be world-readable.
+    // Note: OpenOptions::mode() only applies to O_CREAT (new files). A pre-existing
+    // log file with wider permissions retains those permissions, so we explicitly
+    // chmod after opening to enforce 0600 regardless of the file's prior state.
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut log_opts = std::fs::OpenOptions::new();
@@ -98,6 +130,12 @@ async fn run() -> Result<ExitCode> {
     let log_file = log_opts
         .open(&log_file_path)
         .context("failed to open log file")?;
+    // Enforce 0600 on the open file even if it pre-existed with wider permissions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = log_file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
 
     let filter = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()

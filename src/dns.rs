@@ -36,6 +36,11 @@ pub fn create_resolver() -> Result<Arc<TokioResolver>> {
     opts.use_hosts_file = ResolveHosts::Never;
     opts.num_concurrent_reqs = 2;
     opts.timeout = std::time::Duration::from_secs(5);
+    // Cap retries to prevent Tokio thread exhaustion during a DoH outage.
+    // Without a limit, many simultaneous connections each stacking 5s * N retries
+    // can exhaust the async executor.  2 attempts (1 initial + 1 retry) is sufficient
+    // to handle a single transient UDP/TLS failure.
+    opts.attempts = 2;
 
     let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
         .with_options(opts)
