@@ -113,6 +113,7 @@ pub fn generate_profile(
     let home_str = sanitize_sbpl_path(home)?;
 
     let mut extra_write_rules = String::new();
+    let mut extra_read_rules = String::new();
     for path in allow_paths {
         // Canonicalize to resolve symlinks before interpolating into the SBPL profile.
         // A symlink like /tmp/link -> ~/Library would otherwise bypass the ~/Library deny rule.
@@ -124,6 +125,9 @@ pub fn generate_profile(
         })?;
         let safe = sanitize_sbpl_path(&canonical)?;
         extra_write_rules.push_str(&format!("    (subpath \"{safe}\")\n"));
+        // Also grant reads: paths under a denied tree (e.g. ~/Library) would be
+        // write-only and unusable otherwise — most tools must read what they write.
+        extra_read_rules.push_str(&format!("    (subpath \"{safe}\")\n"));
     }
 
     let ssh_agent_rule = if let Some(dir) = ssh_agent_dir {
@@ -215,9 +219,27 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Developer")
     (subpath "{home_str}/Library/org.swift.swiftpm")
     (subpath "{home_str}/Library/Security")
+    ;; CLI dev tools that store config/data directly under ~/Library (not via
+    ;; cfprefsd), so they need explicit read carve-outs under the ~/Library deny:
+    ;;   - helm: data home (HELM_DATA_HOME = ~/Library/helm); its config home
+    ;;     (Preferences/helm) and cache home (Caches/helm) are already covered above.
+    ;;   - go: `go env`/telemetry file at ~/Library/Application Support/go/env.
+    ;;   - k9s: config.yaml, clusters, aliases under ~/Library/Application Support/k9s.
+    ;;   - jupyter: notebook_secret + runtime under ~/Library/Jupyter.
+    ;;   - nuclei: config.yaml / reporting-config.yaml under .../Application Support/nuclei.
+    ;;   - trunk: update.json under .../Application Support/trunk.
+    ;;   - ollama: models + config under .../Application Support/Ollama.
+    (subpath "{home_str}/Library/helm")
+    (subpath "{home_str}/Library/Application Support/go")
+    (subpath "{home_str}/Library/Application Support/k9s")
+    (subpath "{home_str}/Library/Application Support/nuclei")
+    (subpath "{home_str}/Library/Application Support/trunk")
+    (subpath "{home_str}/Library/Application Support/Ollama")
+    (subpath "{home_str}/Library/Jupyter")
     ;; 1Password group containers: op CLI reads vault data and settings from here
     ;; (~/.config/op is already allowed by the broad file-read* rule above)
-{op_group_container_rules}{ssh_agent_rule})
+{op_group_container_rules}{ssh_agent_rule}    ;; user-supplied --allow-path entries (read; matching writes are granted below)
+{extra_read_rules})
 
 ;; On macOS 11+, /bin, /usr, and /sbin are firmlinks into /System/Volumes/Root.
 ;; The kernel resolves firmlinks before evaluating sandbox subpath rules, so the
@@ -255,8 +277,7 @@ pub fn generate_profile(
     ;; Homebrew prefixes: user-owned, required for `brew install/upgrade/uninstall`.
     ;; /opt/homebrew = Apple Silicon; /usr/local = Intel.
     (subpath "/opt/homebrew")
-    (subpath "/usr/local")
-{extra_write_rules})
+    (subpath "/usr/local"))
 ;; Block writes/clones/links into the sensitive ~/Library subtree.
 (deny file-write* file-clone file-link
     (subpath "{home_str}/Library"))
@@ -275,10 +296,31 @@ pub fn generate_profile(
     (subpath "{home_str}/Library/Keychains")
     (subpath "{home_str}/Library/Developer")
     (subpath "{home_str}/Library/org.swift.swiftpm")
+    ;; CLI dev tools that write config/data directly under ~/Library (not via
+    ;; cfprefsd). Scoped to each tool's own subdir — the broad Preferences/Library
+    ;; denies still block writes to every other app's data:
+    ;;   - helm: repositories.yaml / repositories.lock / registry/config.json under
+    ;;     Preferences/helm, and plugins under ~/Library/helm.
+    ;;   - go: `go env -w` persists to ~/Library/Application Support/go/env + telemetry.
+    ;;   - k9s: writes config and logs under ~/Library/Application Support/k9s.
+    ;;   - jupyter: writes runtime files under ~/Library/Jupyter.
+    ;;   - nuclei: writes scan config under ~/Library/Application Support/nuclei.
+    ;;   - trunk: writes update.json under ~/Library/Application Support/trunk.
+    ;;   - ollama: writes pulled models + config under ~/Library/Application Support/Ollama.
+    (subpath "{home_str}/Library/Preferences/helm")
+    (subpath "{home_str}/Library/helm")
+    (subpath "{home_str}/Library/Application Support/go")
+    (subpath "{home_str}/Library/Application Support/k9s")
+    (subpath "{home_str}/Library/Application Support/nuclei")
+    (subpath "{home_str}/Library/Application Support/trunk")
+    (subpath "{home_str}/Library/Application Support/Ollama")
+    (subpath "{home_str}/Library/Jupyter")
     ;; 1Password group containers: op CLI needs write access for SQLite WAL/SHM
     ;; coordination files (required even for read-only database access) and for
     ;; storing delegated session state when using Desktop App Integration.
-{op_group_container_write_rules})
+{op_group_container_write_rules}    ;; user-supplied --allow-path entries: placed after the ~/Library deny so paths
+    ;; under ~/Library (e.g. an app's data dir) are actually writable, not re-denied.
+{extra_write_rules})
 
 ;; ── Network ──────────────────────────────────────────────────────────────
 {network_rules}
@@ -892,6 +934,88 @@ mod tests {
     }
 
     #[test]
+    fn profile_allows_helm_config_and_data_homes() {
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        // Data home (HELM_DATA_HOME = ~/Library/helm) must be readable: it's under
+        // the ~/Library read deny, so it needs an explicit read carve-out.
+        let read_deny = profile.find(r#"(deny file-read*"#).unwrap();
+        let data_read = profile
+            .find(r#"(subpath "/Users/test/Library/helm")"#)
+            .unwrap();
+        assert!(
+            data_read > read_deny,
+            "~/Library/helm read allow must come after the ~/Library read deny"
+        );
+
+        // Config home (HELM_CONFIG_HOME = ~/Library/Preferences/helm) and the data
+        // home must be writable, after the ~/Library write deny (last match wins).
+        let write_deny = profile.find(r#"(deny file-write*"#).unwrap();
+        let config_write = profile
+            .find(r#"(subpath "/Users/test/Library/Preferences/helm")"#)
+            .unwrap();
+        let data_write = profile
+            .rfind(r#"(subpath "/Users/test/Library/helm")"#)
+            .unwrap();
+        assert!(
+            config_write > write_deny && data_write > write_deny,
+            "helm config/data write allows must come after the ~/Library write deny"
+        );
+    }
+
+    #[test]
+    fn profile_allows_cli_dev_tool_dirs_under_library() {
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        // CLI dev tools that store config/data directly under ~/Library must be
+        // granted both read and write, each after its respective deny.
+        let read_deny = profile.find(r#"(deny file-read*"#).unwrap();
+        let write_deny = profile.find(r#"(deny file-write*"#).unwrap();
+        for dir in [
+            "/Users/test/Library/Application Support/go",
+            "/Users/test/Library/Application Support/k9s",
+            "/Users/test/Library/Application Support/nuclei",
+            "/Users/test/Library/Application Support/trunk",
+            "/Users/test/Library/Application Support/Ollama",
+            "/Users/test/Library/Jupyter",
+        ] {
+            let rule = format!(r#"(subpath "{dir}")"#);
+            let first = profile
+                .find(&rule)
+                .unwrap_or_else(|| panic!("missing carve-out for {dir}"));
+            let last = profile.rfind(&rule).unwrap();
+            assert!(
+                first != last,
+                "{dir} should have both a read and a write carve-out"
+            );
+            assert!(
+                first > read_deny,
+                "{dir} read carve-out must follow the ~/Library read deny"
+            );
+            assert!(
+                last > write_deny,
+                "{dir} write carve-out must follow the ~/Library write deny"
+            );
+        }
+    }
+
+    #[test]
     fn profile_localhost_only_network_by_default() {
         let profile = generate_profile(
             Path::new("/tmp/proj"),
@@ -943,6 +1067,27 @@ mod tests {
         .unwrap();
         assert!(profile.contains(&format!(r#"(subpath "{}")"#, canonical1.display())));
         assert!(profile.contains(&format!(r#"(subpath "{}")"#, canonical2.display())));
+
+        // --allow-path must grant BOTH read and write: a path under a denied tree
+        // would be write-only and unusable otherwise. The subpath appears once in
+        // the read allow block and once in the write allow block.
+        let rule1 = format!(r#"(subpath "{}")"#, canonical1.display());
+        let read_deny = profile.find(r#"(deny file-read*"#).unwrap();
+        let write_deny = profile.find(r#"(deny file-write*"#).unwrap();
+        let first = profile.find(&rule1).unwrap();
+        let last = profile.rfind(&rule1).unwrap();
+        assert!(
+            first != last,
+            "--allow-path entry should appear in both read and write allow blocks"
+        );
+        assert!(
+            first > read_deny && first < write_deny,
+            "--allow-path read carve-out must follow the read deny and precede the write block"
+        );
+        assert!(
+            last > write_deny,
+            "--allow-path write carve-out must follow the write deny"
+        );
     }
 
     #[test]

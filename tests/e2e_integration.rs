@@ -329,3 +329,73 @@ fn sandboxed_read_permissions() {
         }
     }
 }
+
+/// Test: sandboxed process can read+write helm's config home (~/Library/Preferences/helm)
+/// and data home (~/Library/helm), both of which sit under the ~/Library deny.
+#[test]
+fn sandboxed_helm_config_and_data_homes() {
+    if common::already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap();
+    let profile = ziplock::sandbox::generate_profile(
+        Path::new("/tmp/ziplock-e2e-helm"),
+        Path::new(&home),
+        &[],
+        true,
+        None,
+        &[],
+    )
+    .unwrap();
+    std::fs::create_dir_all("/tmp/ziplock-e2e-helm").ok();
+
+    // Pre-create the helm homes outside the sandbox so the test exercises file
+    // ops within them rather than directory creation under ~/Library.
+    let config_home = format!("{home}/Library/Preferences/helm");
+    let data_home = format!("{home}/Library/helm");
+    std::fs::create_dir_all(&config_home).ok();
+    std::fs::create_dir_all(&data_home).ok();
+
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
+
+    match unsafe { nix::unistd::fork() }.expect("fork failed") {
+        nix::unistd::ForkResult::Child => {
+            common::apply_sandbox(&profile).unwrap_or_else(|e| {
+                eprintln!("sandbox_init failed: {e}");
+                std::process::exit(99);
+            });
+
+            // Config home: helm rewrites repositories.yaml / repositories.lock here.
+            let cfg_file = format!("{config_home}/.ziplock-e2e");
+            std::fs::write(&cfg_file, b"repo: test\n")
+                .expect("should be able to write helm config home");
+            assert_eq!(
+                std::fs::read(&cfg_file).expect("should be able to read helm config home"),
+                b"repo: test\n"
+            );
+            std::fs::remove_file(&cfg_file).ok();
+
+            // Data home: helm stores plugins / repo cache here.
+            let data_file = format!("{data_home}/.ziplock-e2e");
+            std::fs::write(&data_file, b"plugin\n")
+                .expect("should be able to write helm data home");
+            assert!(
+                std::fs::read_dir(&data_home).is_ok(),
+                "should be able to read helm data home"
+            );
+            std::fs::remove_file(&data_file).ok();
+
+            std::process::exit(0);
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            use nix::sys::wait::WaitStatus;
+            match nix::sys::wait::waitpid(child, None).expect("waitpid failed") {
+                WaitStatus::Exited(_, 0) => {}
+                WaitStatus::Exited(_, code) => panic!("child exited with code {code}"),
+                other => panic!("child exited abnormally: {other:?}"),
+            }
+        }
+    }
+}
