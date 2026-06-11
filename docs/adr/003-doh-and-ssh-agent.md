@@ -44,6 +44,8 @@ The DoH connection is made from ziplock's own (unsandboxed) process — the sand
 
 **Resolver timeout:** `ResolverOpts::timeout` is set explicitly to 5 seconds (matching hickory's internal default, but made explicit so the value is visible and intentional). If Cloudflare is unreachable, DNS resolution fails after 5 s, all non-localhost connections are denied, and Claude cannot reach the internet — a safe-fail outcome.
 
+**Transient h2-reset retry:** The DoH resolver keeps a long-lived HTTP/2 connection to Cloudflare. Cloudflare periodically sends GOAWAY / resets the idle connection, and hickory fails the *in-flight* query with `received a stream error: connection reset` (or `broken pipe`) instead of transparently reconnecting. A single such failure made the proxy block the CONNECT — surfacing intermittently as Claude Code's `Unable to verify if domain X is safe to fetch … network restrictions` (its `domain_info` WebFetch preflight) or as `op` and other tools failing seemingly at random. Because the *next* lookup re-establishes the connection, `resolve_host` retries via `retry_transient` up to 3 attempts with linear backoff (50 ms × attempt). Permanent failures (`NetError::is_no_records_found()` — NXDOMAIN) short-circuit immediately so genuine misses and DNS-filter blocks (`0.0.0.0`) are neither slowed nor masked.
+
 ### 1Password SSH Agent
 
 Scan `~/Library/Group Containers/` at startup for any directory whose name contains `1password` or `agilebits`, then check for `t/agent.sock` within it. If found:

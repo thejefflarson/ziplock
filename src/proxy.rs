@@ -102,6 +102,40 @@ pub(crate) fn is_blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// Max DoH lookup attempts before giving up — covers a single transient h2 connection
+/// reset between Cloudflare's GOAWAY and hickory establishing a fresh connection.
+const DNS_MAX_ATTEMPTS: u32 = 3;
+
+/// Retry an async operation up to `max_attempts` times, backing off linearly
+/// (50ms × attempt) between tries. `is_permanent` short-circuits the retry loop for
+/// errors that re-running cannot fix (e.g. NXDOMAIN); transient errors are retried.
+/// `what` labels the operation in the retry log line.
+async fn retry_transient<T, E, Op, Fut, Perm>(
+    max_attempts: u32,
+    what: &str,
+    mut op: Op,
+    is_permanent: Perm,
+) -> Result<T, E>
+where
+    Op: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    Perm: Fn(&E) -> bool,
+    E: std::fmt::Display,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_permanent(&e) || attempt >= max_attempts => return Err(e),
+            Err(e) => {
+                warn!("{what} failed (attempt {attempt}/{max_attempts}), retrying: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(attempt))).await;
+            }
+        }
+    }
+}
+
 /// Resolve a hostname to a list of safe IPs to try, in connect order.
 /// IPv4 addresses are preferred — networks without an IPv6 default route return
 /// `EHOSTUNREACH` when connecting to AAAA results, so we try v4 first and fall
@@ -121,10 +155,19 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<Vec<IpAddr
         return resolve_local_mdns(host).await.map(|ip| vec![ip]);
     }
 
-    let response = resolver
-        .lookup_ip(host)
-        .await
-        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
+    // The DoH resolver holds a long-lived HTTP/2 connection to Cloudflare. Cloudflare
+    // periodically sends GOAWAY / resets idle connections, and hickory fails the in-flight
+    // query ("received a stream error: connection reset" / "broken pipe") rather than
+    // transparently reconnecting. The next lookup re-establishes the connection, so we retry
+    // transient failures. Genuine NXDOMAIN (NoRecordsFound) is permanent — return it at once.
+    let response = retry_transient(
+        DNS_MAX_ATTEMPTS,
+        host,
+        || resolver.lookup_ip(host),
+        |e| e.is_no_records_found(),
+    )
+    .await
+    .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
 
     let mut ips: Vec<IpAddr> = response.iter().collect();
     if ips.is_empty() {
@@ -646,5 +689,77 @@ mod tests {
         );
         assert_eq!(extract_host_from_url("ftp://example.com"), None);
         assert_eq!(extract_host_from_url("not-a-url"), None);
+    }
+
+    #[tokio::test]
+    async fn retry_transient_succeeds_after_transient_failures() {
+        // Surface the retry warnings when run with `--nocapture` so the behavior is
+        // observable; harmless no-op if a subscriber is already installed.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
+        // Fail twice (transient), then succeed on the third attempt — mirrors a DoH
+        // h2 connection reset that clears once hickory re-establishes the connection.
+        let calls = std::cell::Cell::new(0u32);
+        let result = retry_transient(
+            3,
+            "test lookup",
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                async move {
+                    if n < 3 {
+                        Err("connection reset".to_string())
+                    } else {
+                        Ok(42u32)
+                    }
+                }
+            },
+            |_e: &String| false, // never permanent
+        )
+        .await;
+        assert_eq!(result, Ok(42));
+        assert_eq!(
+            calls.get(),
+            3,
+            "should have retried up to the third attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_transient_stops_on_permanent_error() {
+        // A permanent error (e.g. NXDOMAIN) must not be retried.
+        let calls = std::cell::Cell::new(0u32);
+        let result: Result<u32, String> = retry_transient(
+            3,
+            "test lookup",
+            || {
+                calls.set(calls.get() + 1);
+                async { Err("no records found".to_string()) }
+            },
+            |e: &String| e.contains("no records"), // permanent
+        )
+        .await;
+        assert_eq!(result, Err("no records found".to_string()));
+        assert_eq!(calls.get(), 1, "permanent error must not be retried");
+    }
+
+    #[tokio::test]
+    async fn retry_transient_gives_up_after_max_attempts() {
+        // Persistent transient failure: exhaust attempts and return the last error.
+        let calls = std::cell::Cell::new(0u32);
+        let result: Result<u32, String> = retry_transient(
+            3,
+            "test lookup",
+            || {
+                calls.set(calls.get() + 1);
+                async { Err("connection reset".to_string()) }
+            },
+            |_e: &String| false,
+        )
+        .await;
+        assert_eq!(result, Err("connection reset".to_string()));
+        assert_eq!(calls.get(), 3, "should stop after max attempts");
     }
 }
