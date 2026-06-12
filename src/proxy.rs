@@ -149,46 +149,49 @@ async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<Vec<IpAddr
     }
 
     // .local domains are mDNS (Bonjour) — Cloudflare DoH has no knowledge of them.
-    // Use the system resolver (getaddrinfo → mDNSResponder via Unix socket, which the
-    // sandbox allows via `network-outbound (remote unix-socket)`).
+    // Resolve via the system resolver (getaddrinfo → mDNSResponder via Unix socket, which
+    // the sandbox allows via `network-outbound (remote unix-socket)`).
     if host.ends_with(".local") {
-        return resolve_local_mdns(host).await.map(|ip| vec![ip]);
+        return resolve_system_private(host).await;
     }
 
     // The DoH resolver holds a long-lived HTTP/2 connection to Cloudflare. Cloudflare
     // periodically sends GOAWAY / resets idle connections, and hickory fails the in-flight
     // query ("received a stream error: connection reset" / "broken pipe") rather than
     // transparently reconnecting. The next lookup re-establishes the connection, so we retry
-    // transient failures. Genuine NXDOMAIN (NoRecordsFound) is permanent — return it at once.
-    let response = retry_transient(
+    // transient failures. Genuine NXDOMAIN (NoRecordsFound) is permanent — fall through to
+    // the system resolver, which knows LAN/router/hosts names Cloudflare cannot.
+    match retry_transient(
         DNS_MAX_ATTEMPTS,
         host,
         || resolver.lookup_ip(host),
         |e| e.is_no_records_found(),
     )
     .await
-    .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
-
-    let mut ips: Vec<IpAddr> = response.iter().collect();
-    if ips.is_empty() {
-        return Err(format!("no addresses found for {host}"));
+    {
+        Ok(response) => {
+            let ips: Vec<IpAddr> = response.iter().collect();
+            if ips.is_empty() {
+                // DoH returned no A/AAAA — try the system resolver for LAN names.
+                return resolve_system_private(host).await;
+            }
+            vet_doh_answer(ips, host)
+        }
+        // Cloudflare doesn't know this name (NXDOMAIN) — likely a LAN/router/hosts/mDNS
+        // hostname. Fall back to the system resolver (LAN access is enabled).
+        Err(e) if e.is_no_records_found() => resolve_system_private(host).await,
+        Err(e) => Err(format!("DNS resolution failed for {host}: {e}")),
     }
+}
 
-    // A single blocked IP (Cloudflare returns 0.0.0.0 for malware/adult) means the whole
-    // domain is blocked; reject without attempting any candidate.
+/// Vet a non-empty DoH answer. Malware/adult blocks (Cloudflare returns 0.0.0.0) are
+/// rejected. Private/RFC1918/LAN addresses are ALLOWED — LAN access is enabled by default,
+/// so a domain (incl. split-horizon names) resolving to a private IP is permitted. Returns
+/// the IPs ordered v4-first so boxes without an IPv6 default route don't fail EHOSTUNREACH.
+fn vet_doh_answer(mut ips: Vec<IpAddr>, host: &str) -> Result<Vec<IpAddr>, String> {
     if ips.iter().any(is_blocked_ip) {
         return Err(format!("domain blocked by DNS filter: {host}"));
     }
-    // If any resolved IP is private/link-local/CGNAT/etc. we must reject the lookup entirely
-    // rather than silently falling back to a public address — otherwise a DNS-rebinding
-    // attacker could mix a public and private answer and steer us to the private one.
-    if let Some(bad) = ips.iter().find(|ip| is_private_ip(ip)) {
-        return Err(format!(
-            "domain resolved to private IP, blocked: {host} -> {bad}"
-        ));
-    }
-
-    // Prefer v4 so boxes without an IPv6 default route don't fail with EHOSTUNREACH.
     ips.sort_by_key(|ip| if ip.is_ipv4() { 0u8 } else { 1u8 });
     Ok(ips)
 }
@@ -210,25 +213,31 @@ async fn connect_any(ips: &[IpAddr], port: u16) -> std::io::Result<TcpStream> {
     }))
 }
 
-/// Resolve a `.local` mDNS hostname via the system resolver (mDNSResponder).
-/// The result must be a private IP — `.local` names should never resolve to public addresses.
-async fn resolve_local_mdns(host: &str) -> Result<IpAddr, String> {
+/// Resolve a hostname via the system resolver (getaddrinfo → mDNSResponder, the router's
+/// DHCP DNS, and `/etc/hosts`). Used for LAN/mDNS names Cloudflare DoH can't resolve.
+///
+/// The result is accepted ONLY if every address is private. A public answer here would let
+/// any caller bypass the DoH malware/adult filter by routing a public name through the
+/// system resolver, so we refuse it and force such names back through DoH. Returns IPs
+/// ordered v4-first.
+async fn resolve_system_private(host: &str) -> Result<Vec<IpAddr>, String> {
     let addrs = tokio::net::lookup_host(format!("{host}:0"))
         .await
-        .map_err(|e| format!("mDNS lookup failed for {host}: {e}"))?;
+        .map_err(|e| format!("system DNS lookup failed for {host}: {e}"))?;
 
-    let ip = addrs
-        .map(|sa| sa.ip())
-        .next()
-        .ok_or_else(|| format!("no addresses found for {host}"))?;
+    let mut ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+    if ips.is_empty() {
+        return Err(format!("no addresses found for {host}"));
+    }
 
-    if !is_private_ip(&ip) {
+    if let Some(public) = ips.iter().find(|ip| !is_private_ip(ip)) {
         return Err(format!(
-            ".local domain resolved to non-private IP (suspicious): {host} -> {ip}"
+            "system resolver returned public IP for {host} -> {public}; refusing (public names must resolve via DoH)"
         ));
     }
 
-    Ok(ip)
+    ips.sort_by_key(|ip| if ip.is_ipv4() { 0u8 } else { 1u8 });
+    Ok(ips)
 }
 
 // ── SOCKS5 (using fast-socks5 for protocol handling) ────────────────────────
@@ -633,21 +642,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_local_mdns_resolves_via_system_resolver() {
-        // localhost.local isn't a real mDNS name, but we can verify the code path
-        // doesn't attempt DoH. The function should either resolve or return a DNS error —
-        // what it must NOT do is route through Cloudflare.
-        //
-        // We verify the routing by checking the function exists and compiles; actual
-        // mDNS resolution requires a live network with a .local device present.
-        let result = resolve_local_mdns("nonexistent-device-ziplock-test.local").await;
-        // Should fail with mDNS error, not a DoH error
+    async fn test_system_resolver_rejects_nonexistent_name() {
+        // A nonexistent LAN/mDNS name must fail via the system resolver — never via DoH.
+        let result = resolve_system_private("nonexistent-device-ziplock-test.local").await;
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(
-            msg.contains("mDNS lookup failed") || msg.contains("no addresses found"),
+            msg.contains("system DNS lookup failed") || msg.contains("no addresses found"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_system_resolver_accepts_localhost_private() {
+        // localhost resolves locally (no network) to 127.0.0.1/::1 — all private, so the
+        // all-private gate accepts it and orders v4 first.
+        let ips = resolve_system_private("localhost")
+            .await
+            .expect("localhost should resolve");
+        assert!(!ips.is_empty());
+        assert!(
+            ips.iter().all(is_private_ip),
+            "all localhost addrs must be private: {ips:?}"
+        );
+        assert!(ips[0].is_ipv4(), "v4 should sort first: {ips:?}");
+    }
+
+    #[test]
+    fn vet_doh_answer_allows_private_blocks_filtered() {
+        let private = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let public = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let blocked = IpAddr::V4(Ipv4Addr::UNSPECIFIED); // 0.0.0.0 → malware/adult block
+
+        // LAN access enabled: a private answer is now permitted.
+        assert_eq!(
+            vet_doh_answer(vec![private], "nas.example"),
+            Ok(vec![private])
+        );
+        // Mixed public+private is also permitted (split-horizon names).
+        assert!(vet_doh_answer(vec![public, private], "host.example").is_ok());
+        // Malware/adult 0.0.0.0 block is still rejected.
+        assert!(vet_doh_answer(vec![blocked], "bad.example").is_err());
+        assert!(
+            vet_doh_answer(vec![public, blocked], "bad.example").is_err(),
+            "any 0.0.0.0 in the set blocks the domain"
+        );
+        // v4 is ordered ahead of v6.
+        let v6: IpAddr = "2606:2800:220:1::1".parse().unwrap();
+        let ordered = vet_doh_answer(vec![v6, public], "host.example").unwrap();
+        assert!(ordered[0].is_ipv4(), "v4 should sort first: {ordered:?}");
     }
 
     #[test]
