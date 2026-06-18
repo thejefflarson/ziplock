@@ -449,6 +449,11 @@ pub fn generate_profile(
     (global-name "com.apple.diagnosticd")
     (global-name "com.apple.rtcreportingd")
     (global-name "com.apple.powerlog.plxpclogger.xpc")
+    ;; ── Clipboard ────────────────────────────────────────────────────────
+    ;; Pasteboard server (pboard daemon). NSPasteboard / pbcopy / pbpaste all
+    ;; mach-lookup this; without it Claude's copy-on-select and pbcopy fail
+    ;; silently (exit 1, no clipboard write).
+    (global-name "com.apple.pasteboard.1")
     ;; ── Input method ─────────────────────────────────────────────────────
     ;; Terminal keyboard input (input method selection, IME services)
     (global-name "com.apple.inputmethodkit.getxpcendpoint")
@@ -1165,6 +1170,23 @@ mod tests {
         assert!(
             profile.contains("(allow process-info*)"),
             "profile must contain (allow process-info*) for ps/top/htop support"
+        );
+    }
+
+    #[test]
+    fn profile_allows_pasteboard() {
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            profile.contains("(global-name \"com.apple.pasteboard.1\")"),
+            "profile must allow the pasteboard service for pbcopy/copy-on-select"
         );
     }
 
