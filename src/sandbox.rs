@@ -253,6 +253,14 @@ pub fn generate_profile(
     (subpath "/usr/share")
     (subpath "/sbin")
     (subpath "/usr/sbin")
+    ;; /System/Cryptexes/App/usr/bin ships in the default macOS PATH *before*
+    ;; /usr/bin:/bin. A bare-name exec (e.g. npm's `spawn("sh", ["-c", script])`)
+    ;; makes posix_spawnp walk PATH in order; without this carve-out the kernel
+    ;; denies the /System read and posix_spawnp ABORTS the search with EPERM
+    ;; instead of falling through to /bin/sh — so `npm run <script>` dies with
+    ;; EPERM/spawn -> exit -1 -> 255. Allowing read turns that into a clean
+    ;; ENOENT skip. (Direct/absolute-path execs were never affected.)
+    (subpath "/System/Cryptexes")
     ;; Homebrew: /opt/homebrew on Apple Silicon, /usr/local on Intel
     (subpath "/opt/homebrew")
     (subpath "/usr/local"))
@@ -702,10 +710,19 @@ pub fn spawn_claude(
     cmd.env("XBS_DISABLE_SANDBOXED_BUILDS", "1");
     cmd.env("SWIFTPM_SANDBOX", "0");
 
-    // Per-uid TMPDIR to avoid a shared /tmp/claude that another user on the host
-    // could pre-create as a symlink, redirecting Claude's temp writes elsewhere.
-    let tmp_claude = ensure_user_tmpdir()?;
-    cmd.env("TMPDIR", &tmp_claude);
+    // Preserve the inherited TMPDIR when present. macOS login/terminal sessions
+    // set TMPDIR to the per-user /var/folders/.../T dir (mode 0700, OS-managed,
+    // not symlink-attackable, and covered by the /private/var/folders carve-out).
+    // Claude Code keys its SendMessage IPC sockets off $TMPDIR, so overriding it
+    // here strands those sockets in /tmp/claude.<uid> where non-sandboxed sessions
+    // (and a pre-existing `claude --bg` daemon) can't find them — silently
+    // breaking cross-session agent messaging. Only fall back to a verified per-uid
+    // /tmp dir when TMPDIR is unset (e.g. headless/cron), avoiding the world-
+    // writable /tmp default that Node/Bun would otherwise pick.
+    if std::env::var_os("TMPDIR").is_none() {
+        let tmp_claude = ensure_user_tmpdir()?;
+        cmd.env("TMPDIR", &tmp_claude);
+    }
 
     // Apply sandbox in pre_exec (after fork, before exec)
     let profile_for_closure = profile.clone();
@@ -1307,6 +1324,35 @@ mod tests {
         // allowed for process-exec so node, npm, python, etc. can be spawned.
         assert!(profile.contains(r#"(subpath "/opt/homebrew")"#));
         assert!(profile.contains(r#"(subpath "/usr/local")"#));
+    }
+
+    #[test]
+    fn profile_allows_system_cryptexes_for_path_search() {
+        // /System/Cryptexes/App/usr/bin is in the default macOS PATH before
+        // /usr/bin:/bin. A bare-name exec (npm's `spawn("sh", ...)`) makes
+        // posix_spawnp walk PATH; if reading /System is denied there, the search
+        // aborts with EPERM (-> `npm run` exits 255) instead of falling through
+        // to /bin/sh. The carve-out must read+exec-allow it AND appear after the
+        // (deny file-read* (subpath "/System")) rule (last-match-wins).
+        let profile = generate_profile(
+            Path::new("/tmp/proj"),
+            Path::new("/Users/test"),
+            &[],
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+        let rule = r#"(subpath "/System/Cryptexes")"#;
+        assert!(
+            profile.contains(rule),
+            "profile must allow /System/Cryptexes so bare-name PATH execs (npm run) don't EPERM"
+        );
+        let deny_pos = profile.find(r#"(deny file-read*"#).unwrap();
+        assert!(
+            profile.find(rule).unwrap() > deny_pos,
+            "/System/Cryptexes carve-out must follow the /System deny rule"
+        );
     }
 
     #[test]
