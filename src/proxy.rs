@@ -7,8 +7,16 @@ use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{ReplyError, Socks5Command};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
+use tokio::time::{Duration, timeout};
 use tracing::{debug, error, info, warn};
+
+/// Maximum number of concurrent proxy connections (SOCKS5 + HTTP combined).
+const MAX_CONNECTIONS: usize = 256;
+/// Timeout for establishing an outbound TCP connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout for reading HTTP request headers (slow-loris mitigation).
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::dns::TokioResolver;
 
@@ -21,6 +29,8 @@ pub struct ProxyPorts {
 /// Start both proxy servers. Returns the assigned ports and a shutdown sender.
 pub async fn start(resolver: Arc<TokioResolver>) -> Result<(ProxyPorts, watch::Sender<bool>)> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Shared connection semaphore: caps total concurrent connections across both listeners.
+    let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     let socks_listener = TcpListener::bind("127.0.0.1:0").await?;
     let socks_port = socks_listener.local_addr()?.port();
@@ -31,12 +41,13 @@ pub async fn start(resolver: Arc<TokioResolver>) -> Result<(ProxyPorts, watch::S
     {
         let resolver = resolver.clone();
         let shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(socks5_accept_loop(socks_listener, resolver, shutdown_rx));
+        let sem = conn_sem.clone();
+        tokio::spawn(socks5_accept_loop(socks_listener, resolver, sem, shutdown_rx));
     }
     {
         let resolver = resolver.clone();
         let shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(http_accept_loop(http_listener, resolver, shutdown_rx));
+        tokio::spawn(http_accept_loop(http_listener, resolver, conn_sem, shutdown_rx));
     }
 
     info!(
@@ -68,12 +79,26 @@ pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
                 return is_private_v4(&v4);
             }
             let s = v6.segments();
+            // IPv4-translated ::ffff:0:x.x.x.x/96 (RFC 6052): NOT caught by to_ipv4_mapped().
+            // On dual-stack hosts the kernel routes these to the embedded IPv4.
+            if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0xffff && s[5] == 0 {
+                let embedded = std::net::Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    s[6] as u8,
+                    (s[7] >> 8) as u8,
+                    s[7] as u8,
+                );
+                return is_private_v4(&embedded);
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || (s[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
                 || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
                 || (s[0] & 0xff00) == 0xff00 // multicast ff00::/8
                 || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
+                // NAT64 Well-Known Prefix 64:ff9b::/96 and local-use 64:ff9b:1::/48 (RFC 6052, 8215).
+                // DoH AAAA records using these prefixes synthesize private IPv4 targets.
+                || (s[0] == 0x0064 && s[1] == 0xff9b)
         }
     }
 }
@@ -98,7 +123,12 @@ fn is_private_v4(v4: &Ipv4Addr) -> bool {
 pub(crate) fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => *v4 == Ipv4Addr::UNSPECIFIED,
-        IpAddr::V6(v6) => v6.is_unspecified(),
+        IpAddr::V6(v6) => {
+            // Also catch the IPv4-mapped form ::ffff:0.0.0.0
+            v6.is_unspecified()
+                || v6.to_ipv4_mapped()
+                    .map_or(false, |v4| v4 == Ipv4Addr::UNSPECIFIED)
+        }
     }
 }
 
@@ -142,8 +172,11 @@ where
 /// back to v6.
 async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<Vec<IpAddr>, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
+        // Block direct connections to private/loopback addresses — SSRF guard.
+        // Private IPs must never be reachable by supplying a literal address to
+        // SOCKS5/HTTP CONNECT (bypassing DNS filtering entirely).
         if is_private_ip(&ip) {
-            return Ok(vec![ip]);
+            return Err(format!("direct private IP connections blocked: {ip}"));
         }
         return Err(format!("direct public IP connections blocked: {ip}"));
     }
@@ -200,11 +233,18 @@ fn vet_doh_answer(mut ips: Vec<IpAddr>, host: &str) -> Result<Vec<IpAddr>, Strin
 async fn connect_any(ips: &[IpAddr], port: u16) -> std::io::Result<TcpStream> {
     let mut last_err: Option<std::io::Error> = None;
     for &ip in ips {
-        match TcpStream::connect((ip, port)).await {
-            Ok(s) => return Ok(s),
-            Err(e) => {
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect((ip, port))).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => {
                 debug!("connect {ip}:{port} failed: {e}");
                 last_err = Some(e);
+            }
+            Err(_) => {
+                debug!("connect {ip}:{port} timed out");
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connection timed out",
+                ));
             }
         }
     }
@@ -245,6 +285,7 @@ async fn resolve_system_private(host: &str) -> Result<Vec<IpAddr>, String> {
 async fn socks5_accept_loop(
     listener: TcpListener,
     resolver: Arc<TokioResolver>,
+    conn_sem: Arc<Semaphore>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -253,8 +294,16 @@ async fn socks5_accept_loop(
                 match result {
                     Ok((stream, addr)) => {
                         debug!("socks5 connection from {addr}");
+                        let permit = match conn_sem.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                warn!("connection limit ({MAX_CONNECTIONS}) reached, dropping socks5 connection from {addr}");
+                                continue;
+                            }
+                        };
                         let resolver = resolver.clone();
                         tokio::spawn(async move {
+                            let _permit = permit; // released when task completes
                             if let Err(e) = handle_socks5(stream, &resolver).await {
                                 debug!("socks5 handler error: {e}");
                             }
@@ -335,6 +384,7 @@ async fn handle_socks5(stream: TcpStream, resolver: &TokioResolver) -> Result<()
 async fn http_accept_loop(
     listener: TcpListener,
     resolver: Arc<TokioResolver>,
+    conn_sem: Arc<Semaphore>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -343,8 +393,16 @@ async fn http_accept_loop(
                 match result {
                     Ok((stream, addr)) => {
                         debug!("http proxy connection from {addr}");
+                        let permit = match conn_sem.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                warn!("connection limit ({MAX_CONNECTIONS}) reached, dropping http connection from {addr}");
+                                continue;
+                            }
+                        };
                         let resolver = resolver.clone();
                         tokio::spawn(async move {
+                            let _permit = permit; // released when task completes
                             if let Err(e) = handle_http(stream, &resolver).await {
                                 debug!("http proxy handler error: {e}");
                             }
@@ -361,8 +419,9 @@ async fn http_accept_loop(
     }
 }
 
-async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<()> {
-    // Read request headers
+/// Read HTTP request headers from `stream`, returning the raw bytes up to and
+/// including the blank-line terminator (`\r\n\r\n`).  Capped at 8 KiB total.
+async fn read_http_headers(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; 8192];
     let mut total = 0;
     loop {
@@ -378,6 +437,19 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
             anyhow::bail!("request too large");
         }
     }
+    buf.truncate(total);
+    Ok(buf)
+}
+
+async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<()> {
+    // Read headers with a per-connection timeout to prevent slow-loris attacks
+    // (a sender that trickles one byte at a time can otherwise pin a Tokio task forever).
+    let buf = match timeout(HEADER_READ_TIMEOUT, read_http_headers(&mut stream)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("header read timed out"),
+    };
+    let total = buf.len();
 
     let request = String::from_utf8_lossy(&buf[..total]);
     let first_line = request.lines().next().unwrap_or("");
@@ -416,13 +488,12 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
             },
             Err(reason) => {
                 warn!("http CONNECT blocked: {reason}");
-                let body = reason.as_bytes();
-                let resp = format!(
-                    "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(resp.as_bytes()).await?;
-                stream.write_all(body).await?;
+                // Return a generic body — do NOT echo `reason` which contains the resolved IP.
+                // Sending the resolved IP back to the sandboxed process turns the proxy into
+                // a DNS oracle that lets Claude enumerate reachable private ranges.
+                stream
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\n\r\nBlocked")
+                    .await?;
             }
         }
     } else {
@@ -447,7 +518,11 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
             match resolve_host(resolver, &host).await {
                 Ok(ips) => match connect_any(&ips, port).await {
                     Ok(mut target_stream) => {
-                        target_stream.write_all(&buf[..total]).await?;
+                        // Rewrite the client-supplied Host header to the DNS-resolved authority.
+                        // Without this, a crafted Host: header that differs from the URL host
+                        // causes virtual-host confusion on shared upstream servers.
+                        let rewritten = rewrite_host_header(&buf[..total], &host, port, 80);
+                        target_stream.write_all(&rewritten).await?;
                         tokio::io::copy_bidirectional(&mut stream, &mut target_stream)
                             .await
                             .ok();
@@ -479,10 +554,18 @@ fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
     // Handle IPv6 bracket notation [::1]:port
     if let Some(rest) = s.strip_prefix('[') {
         if let Some((addr, port_str)) = rest.rsplit_once("]:") {
+            // Validate that the bracket content is actually an IPv6 address.
+            // Without this check, "[evil.com]:443" would extract "evil.com" as the
+            // host, causing misleading audit logs and potential security bypasses in
+            // code that treats bracket-extracted content as trusted IPv6 literals.
+            addr.parse::<std::net::Ipv6Addr>()
+                .context("bracket notation must contain a valid IPv6 address")?;
             let port = port_str.parse::<u16>().context("invalid port")?;
             return Ok((addr.to_string(), port));
         }
         if let Some(addr) = rest.strip_suffix(']') {
+            addr.parse::<std::net::Ipv6Addr>()
+                .context("bracket notation must contain a valid IPv6 address")?;
             return Ok((addr.to_string(), default_port));
         }
     }
@@ -527,13 +610,54 @@ fn has_cl_te_conflict(raw: &[u8]) -> bool {
     has_cl && has_te
 }
 
-/// Extract host:port from an absolute URL like "http://host:port/path".
+/// Extract host:port from an absolute HTTP URL like "http://host:port/path".
+///
+/// Only `http://` is accepted — silently forwarding `https://` plain-text would
+/// downgrade the connection without the client's knowledge.
+///
+/// RFC 3986 userinfo (`user:pass@host`) is stripped before returning the authority:
+/// the DNS lookup and Host header are based on the hostname, not the raw authority,
+/// preventing log-spoofing via `http://attacker.com@legitimate.com/path`.
 fn extract_host_from_url(url: &str) -> Option<String> {
-    let without_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let host_port = without_scheme.split('/').next()?;
+    let without_scheme = url.strip_prefix("http://")?;
+    let authority = without_scheme.split('/').next()?;
+    // Strip RFC 3986 userinfo (everything up to and including the last '@').
+    let host_port = authority.rfind('@').map(|i| &authority[i + 1..]).unwrap_or(authority);
     Some(host_port.to_string())
+}
+
+/// Rewrite the `Host` header in a raw HTTP request to the canonical authority used for
+/// DNS resolution.  This prevents virtual-host confusion where a client-supplied Host
+/// header differs from the URL authority (e.g. `http://real.com/` with `Host: evil.com`).
+///
+/// Only the header section (before `\r\n\r\n`) is touched; the body is forwarded verbatim.
+fn rewrite_host_header(raw: &[u8], canonical_host: &str, port: u16, default_port: u16) -> Vec<u8> {
+    let canonical = if port == default_port {
+        canonical_host.to_string()
+    } else {
+        format!("{canonical_host}:{port}")
+    };
+    // Find the blank-line separator between headers and body.
+    let Some(sep) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return raw.to_vec();
+    };
+    let Ok(header_str) = std::str::from_utf8(&raw[..sep]) else {
+        return raw.to_vec();
+    };
+    let rewritten: String = header_str
+        .split("\r\n")
+        .map(|line| {
+            if line.to_ascii_lowercase().starts_with("host:") {
+                format!("Host: {canonical}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let mut out = rewritten.into_bytes();
+    out.extend_from_slice(&raw[sep..]); // includes \r\n\r\n and body
+    out
 }
 
 #[cfg(test)]
@@ -726,12 +850,19 @@ mod tests {
             extract_host_from_url("http://example.com:8080/path"),
             Some("example.com:8080".to_string())
         );
-        assert_eq!(
-            extract_host_from_url("https://example.com/"),
-            Some("example.com".to_string())
-        );
+        // https:// is rejected by the plain-HTTP proxy (would silently downgrade TLS)
+        assert_eq!(extract_host_from_url("https://example.com/"), None);
         assert_eq!(extract_host_from_url("ftp://example.com"), None);
         assert_eq!(extract_host_from_url("not-a-url"), None);
+        // RFC 3986 userinfo must be stripped
+        assert_eq!(
+            extract_host_from_url("http://user:pass@example.com/path"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            extract_host_from_url("http://attacker.com@legitimate.com/path"),
+            Some("legitimate.com".to_string())
+        );
     }
 
     #[tokio::test]

@@ -30,14 +30,36 @@ fn parse_claude_version(output: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn claude_supports_auto_mode(claude_path: &Path) -> bool {
-    let output = match Command::new(claude_path).arg("--version").output() {
-        Ok(o) => o,
+    // Use spawn() + manual read with a size cap rather than output() which buffers
+    // all stdout with no limit — a malicious binary streaming gigabytes causes OOM.
+    // The version string is at most a few dozen bytes; 4 KiB is more than enough.
+    const MAX_VERSION_BYTES: usize = 4096;
+    let child = match Command::new(claude_path)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
         Err(e) => {
             warn!("could not probe claude --version: {e}; falling back to bypassPermissions");
             return false;
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("could not read claude --version output: {e}; falling back to bypassPermissions");
+            return false;
+        }
+    };
+    // Truncate to limit: if the output exceeds the cap the binary is suspicious anyway.
+    let raw = if output.stdout.len() > MAX_VERSION_BYTES {
+        &output.stdout[..MAX_VERSION_BYTES]
+    } else {
+        &output.stdout
+    };
+    let stdout = String::from_utf8_lossy(raw);
     match parse_claude_version(&stdout) {
         Some(v) => v >= AUTO_MODE_MIN_VERSION,
         None => {
@@ -155,10 +177,12 @@ pub fn generate_profile(
     (local ip "localhost:*"))
   (allow network-bind
     (local ip "localhost:*"))
-  ;; Allow unix domain sockets (needed for various IPC)
-  (allow network-outbound (remote unix-socket))
-  (allow network-inbound (local unix-socket))
-  (allow network-bind (local unix-socket))"#
+  ;; Allow outbound unix domain socket connections.
+  ;; Required for mDNSResponder (/var/run/mDNSResponder), the 1Password SSH agent
+  ;; socket, and XPC services that back Mach ports.
+  ;; Inbound and bind are intentionally omitted: Claude is a client, not a server;
+  ;; allowing it to bind and accept on unix sockets creates covert exfiltration channels.
+  (allow network-outbound (remote unix-socket))"#
             .to_string()
     };
 
@@ -481,9 +505,14 @@ pub fn generate_profile(
     (global-name "com.agilebits.onepassword7-helper")
     (global-name "com.apple.security.agent")
     (global-name "com.apple.secd"))
-(allow mach-register)
+;; Restrict mach-register to per-session (local) names only.
+;; Allowing global-name registration would let Claude squat on bootstrap service names,
+;; enabling interception of same-session Mach lookups (service-name squatting).
+(allow mach-register (local-name-regex #".*"))
 (allow mach-task-name)
-(allow mach-per-user-lookup)
+;; mach-per-user-lookup intentionally omitted: the explicit global-name allowlist above
+;; is sufficient; bare per-user-lookup grants access to third-party security tool endpoints
+;; beyond the enumerated allowlist.
 
 ;; ── PTY (needed for interactive terminal) ────────────────────────────────
 (allow pseudo-tty)
@@ -495,18 +524,27 @@ pub fn generate_profile(
 
 ;; ── Misc ─────────────────────────────────────────────────────────────────
 (allow sysctl-read)
-;; IOKit: required for terminal GPU/graphics queries (Bun runtime, Metal compiler services,
-;; xcodebuild asset catalog processing). Grants read/write to hardware device registries.
-;; Risk: Claude could enumerate USB/GPU devices; cannot escalate privileges or reach other users.
-(allow iokit*)
-;; IPC: POSIX and SysV shared memory and semaphores, required by Bun's worker threads,
+;; IOKit: restrict to property reads only.
+;; iokit-open (included in iokit*) grants connections to kernel driver user-clients
+;; and has been the entry point for historical kernel privilege-escalation CVEs.
+;; GPU/Metal queries (Bun, xcodebuild) need only iokit-get-properties.
+(allow iokit-get-properties)
+;; IPC: POSIX and SysV shared memory/semaphores, required by Bun's worker threads,
 ;; xcodebuild's parallel build coordination, and Swift runtime inter-process data structures.
-;; Risk: shared memory can be used for inter-process data transfer; mitigated by sandbox
-;; constraining which processes Claude can exec or fork.
-(allow ipc*)
-(allow user-preference*)
-(allow system-socket)
-(allow darwin-notification-post)
+;; SysV message queues (ipc-sysv-msg) are excluded — not needed and provide a covert channel.
+(allow ipc-posix-shm*)
+(allow ipc-sysv-shm)
+(allow ipc-sysv-sem)
+;; User preferences: split read/write to document intent.
+;; Ideally write access would be restricted to specific preference domains, but enumerating
+;; all domains used by Claude, npm, git, xcodebuild, etc. is impractical.
+(allow user-preference-read)
+(allow user-preference-write)
+;; system-socket intentionally omitted: grants raw/packet socket creation (AF_RAW, PF_NDRV).
+;; Claude Code has no legitimate need for raw sockets; all traffic flows through the proxy.
+;;
+;; darwin-notification-post intentionally omitted: posting to arbitrary CFNotificationCenter
+;; names provides a low-bandwidth covert exfiltration channel to pre-staged listeners.
 ;; lsopen: required for `open MyApp.app` (dev workflow: build → kill → install → open)
 ;; and Claude Code's OAuth browser launch. Residual risk: prompt injection could open a
 ;; browser to an attacker URL; mitigated by DNS proxy blocking malicious domains.
@@ -589,15 +627,34 @@ fn find_1password_dirs(home: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
     let mut containers = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.contains("1password") || name.contains("agilebits") {
+        // Use suffix matching to prevent a pre-created directory like
+        // `evil.1password.exfil` from triggering a write carve-out.
+        // Legitimate 1Password Group Container names end with `.1password`,
+        // `.agilebits`, or `.onepassword` (bundle ID suffix pattern TEAMID.com.NAME).
+        if name.ends_with(".1password")
+            || name.ends_with(".agilebits")
+            || name.ends_with(".onepassword")
+        {
             let path = entry.path();
+            // Canonicalize to resolve any symlinks before interpolating into the SBPL profile.
+            // A symlink at ~/Library/Group Containers/evil.1password -> /sensitive would
+            // otherwise grant file-write* to the symlink target.
+            let canonical = match std::fs::canonicalize(&path) {
+                Ok(c) => c,
+                Err(_) => continue, // skip unresolvable paths
+            };
             if agent_dir.is_none() {
-                let sock = path.join("t/agent.sock");
-                if sock.exists() {
-                    agent_dir = sock.parent().map(|p| p.to_path_buf());
+                let sock = canonical.join("t/agent.sock");
+                // Use symlink_metadata (lstat) to avoid following a symlink at the socket path.
+                // sock.exists() follows symlinks — a symlink at agent.sock would cause the
+                // symlinked directory to be added as a sandbox write carve-out.
+                if let Ok(meta) = std::fs::symlink_metadata(&sock) {
+                    if meta.file_type().is_socket() || meta.is_file() {
+                        agent_dir = sock.parent().map(|p| p.to_path_buf());
+                    }
                 }
             }
-            containers.push(path);
+            containers.push(canonical);
         }
     }
     (agent_dir, containers)
@@ -666,12 +723,14 @@ pub fn spawn_claude(
         cmd.env("https_proxy", &http_url);
         cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
         cmd.env("no_proxy", "localhost,127.0.0.1,::1");
+        // SAFETY: socks_port is typed u16 — it cannot contain shell metacharacters.
+        // GIT_SSH_COMMAND is evaluated by the shell (sh -c), so any string-typed
+        // source for the port would be a direct shell-injection surface.
+        // If this port source is ever changed from u16, it MUST be shell-escaped first.
+        let socks_port: u16 = ports.socks5;
         cmd.env(
             "GIT_SSH_COMMAND",
-            format!(
-                "ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:{} %h %p'",
-                ports.socks5
-            ),
+            format!("ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:{socks_port} %h %p'"),
         );
     }
 
