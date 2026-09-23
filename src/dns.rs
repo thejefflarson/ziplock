@@ -43,3 +43,26 @@ pub fn create_resolver() -> Result<Arc<TokioResolver>> {
 
     Ok(Arc::new(resolver))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the resolver must complete a DoH TLS handshake to Cloudflare
+    /// and resolve a real name. This guards the trust-store choice — the pinned
+    /// `webpki-roots` bundle could not verify Cloudflare's SSL.com/Comodo
+    /// cross-signed `family.cloudflare-dns.com` cert, failing every lookup with
+    /// `UnknownIssuer` -> `NoConnections`. Verifying via the OS trust store
+    /// (`rustls-platform-verifier`) fixes it. Requires outbound network and must
+    /// run outside any sandbox: `cargo test -- --ignored --test-threads=1`.
+    #[tokio::test]
+    #[ignore = "requires outbound network + no sandbox"]
+    async fn resolver_completes_doh_and_resolves_real_name() {
+        let resolver = create_resolver().expect("create_resolver");
+        let lookup = resolver
+            .lookup_ip("api.anthropic.com")
+            .await
+            .expect("DoH lookup should succeed (regression: cert trust store)");
+        assert!(lookup.iter().next().is_some(), "expected at least one IP");
+    }
+}
