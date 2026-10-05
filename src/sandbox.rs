@@ -34,6 +34,10 @@ fn claude_supports_auto_mode(claude_path: &Path) -> bool {
     // all stdout with no limit — a malicious binary streaming gigabytes causes OOM.
     // The version string is at most a few dozen bytes; 4 KiB is more than enough.
     const MAX_VERSION_BYTES: usize = 4096;
+    // Bound the wait: a stalled `claude --version` would hang ziplock before the
+    // sandbox or proxy are applied, indefinitely blocking the user's session.
+    const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     let child = match Command::new(claude_path)
         .arg("--version")
         .stdout(std::process::Stdio::piped())
@@ -46,10 +50,28 @@ fn claude_supports_auto_mode(claude_path: &Path) -> bool {
             return false;
         }
     };
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
+    let child_pid = child.id();
+    // Run wait_with_output() on a background thread so we can apply a wall-clock timeout.
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(VERSION_PROBE_TIMEOUT) {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             warn!("could not read claude --version output: {e}; falling back to bypassPermissions");
+            return false;
+        }
+        Err(_) => {
+            warn!(
+                "claude --version timed out after {}s; falling back to bypassPermissions",
+                VERSION_PROBE_TIMEOUT.as_secs()
+            );
+            // Kill the stalled child to unblock the background thread.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child_pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
             return false;
         }
     };
@@ -105,7 +127,18 @@ unsafe extern "C" {
 /// Sanitize a path for safe interpolation into an SBPL profile string.
 /// Rejects paths containing characters that could break out of SBPL string literals.
 fn sanitize_sbpl_path(path: &Path) -> Result<String> {
-    let s = path.to_string_lossy().into_owned();
+    // Reject non-UTF-8 paths: to_string_lossy would silently embed U+FFFD (EF BF BD)
+    // replacement characters whose behaviour in the Apple sandbox parser is undocumented
+    // and could corrupt the profile or allow rule injection.
+    let s = path
+        .to_str()
+        .with_context(|| {
+            format!(
+                "path contains non-UTF-8 bytes, cannot embed in sandbox profile: {}",
+                path.display()
+            )
+        })?
+        .to_owned();
     // SBPL uses "..." string literals. A `"` in the path would terminate the literal
     // and allow injection of arbitrary sandbox rules. Reject any path containing
     // characters that are meaningful in SBPL syntax.
@@ -628,14 +661,17 @@ fn find_1password_dirs(home: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
     let mut containers = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        // Use suffix matching to prevent a pre-created directory like
-        // `evil.1password.exfil` from triggering a write carve-out.
-        // Legitimate 1Password Group Container names end with `.1password`,
-        // `.agilebits`, or `.onepassword` (bundle ID suffix pattern TEAMID.com.NAME).
-        if name.ends_with(".1password")
+        // Require the Group Container name to look like a bundle ID: the product
+        // suffix must be preceded by at least two dot-separated components
+        // (e.g. `2BUA8C4S2C.com.1password` — three components, two dots).
+        // A simple `evil.1password` (one dot, two components) passes a bare
+        // suffix check but would grant SBPL write access to any pre-created
+        // directory with that name.
+        let has_valid_suffix = name.ends_with(".1password")
             || name.ends_with(".agilebits")
-            || name.ends_with(".onepassword")
-        {
+            || name.ends_with(".onepassword");
+        let dot_count = name.chars().filter(|&c| c == '.').count();
+        if has_valid_suffix && dot_count >= 2 {
             let path = entry.path();
             // Canonicalize to resolve any symlinks before interpolating into the SBPL profile.
             // A symlink at ~/Library/Group Containers/evil.1password -> /sensitive would

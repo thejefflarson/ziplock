@@ -17,6 +17,14 @@ const MAX_CONNECTIONS: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for reading HTTP request headers (slow-loris mitigation).
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for system DNS resolver calls (LAN/mDNS fallback); prevents a stalled
+/// system resolver from pinning a Tokio task and holding a semaphore permit.
+const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Overall SOCKS5/HTTP handler timeout; caps semaphore-permit lifetime regardless
+/// of TCP-stack behaviour (default TCP keep-alive timeout can exceed two minutes).
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(120);
+/// DNS protocol hostname length limit (RFC 1035 §2.3.4).
+const MAX_HOSTNAME_LEN: usize = 253;
 
 use crate::dns::TokioResolver;
 
@@ -182,6 +190,14 @@ where
 /// `EHOSTUNREACH` when connecting to AAAA results, so we try v4 first and fall
 /// back to v6.
 async fn resolve_host(resolver: &TokioResolver, host: &str) -> Result<Vec<IpAddr>, String> {
+    // Reject over-long hostnames before passing them to the resolver or writing
+    // them to logs — the DNS protocol limit is 253 octets (RFC 1035 §2.3.4).
+    if host.len() > MAX_HOSTNAME_LEN {
+        return Err(format!(
+            "hostname too long ({} bytes, max {MAX_HOSTNAME_LEN})",
+            host.len()
+        ));
+    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         // LAN/private access is intentional in ziplock (CLAUDE.md / ADR 001): a literal
         // private/loopback IP connects directly — reaching a NAS, k8s, Ollama, a localhost
@@ -273,9 +289,15 @@ async fn connect_any(ips: &[IpAddr], port: u16) -> std::io::Result<TcpStream> {
 /// system resolver, so we refuse it and force such names back through DoH. Returns IPs
 /// ordered v4-first.
 async fn resolve_system_private(host: &str) -> Result<Vec<IpAddr>, String> {
-    let addrs = tokio::net::lookup_host(format!("{host}:0"))
-        .await
-        .map_err(|e| format!("system DNS lookup failed for {host}: {e}"))?;
+    // Bound the system resolver call: an adversarial or stalled LAN resolver
+    // would otherwise pin the Tokio task and hold a semaphore permit indefinitely.
+    let addrs = timeout(
+        SYSTEM_DNS_TIMEOUT,
+        tokio::net::lookup_host(format!("{host}:0")),
+    )
+    .await
+    .map_err(|_| format!("system DNS lookup timed out for {host}"))?
+    .map_err(|e| format!("system DNS lookup failed for {host}: {e}"))?;
 
     let mut ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
     if ips.is_empty() {
@@ -316,8 +338,10 @@ async fn socks5_accept_loop(
                         let resolver = resolver.clone();
                         tokio::spawn(async move {
                             let _permit = permit; // released when task completes
-                            if let Err(e) = handle_socks5(stream, &resolver).await {
-                                debug!("socks5 handler error: {e}");
+                            match timeout(HANDLER_TIMEOUT, handle_socks5(stream, &resolver)).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => debug!("socks5 handler error: {e}"),
+                                Err(_) => debug!("socks5 handler timed out"),
                             }
                         });
                     }
@@ -357,7 +381,17 @@ async fn handle_socks5(stream: TcpStream, resolver: &TokioResolver) -> Result<()
         TargetAddr::Domain(domain, port) => (domain, port),
     };
 
-    debug!("socks5 CONNECT {host}:{port}");
+    // Strip IPv6 bracket notation ([::1]) that may appear in SOCKS5 ATYP=0x03
+    // (domain) fields. Without stripping, "[::1]" fails IpAddr parsing and falls
+    // through to DNS resolution, producing a confusing error instead of the
+    // direct-connect path for private/loopback addresses.
+    let host = if host.starts_with('[') && host.ends_with(']') {
+        host[1..host.len() - 1].to_string()
+    } else {
+        host
+    };
+
+    info!("socks5 CONNECT {host}:{port}");
 
     // Resolve DNS through our filtered resolver
     match resolve_host(resolver, &host).await {
@@ -415,8 +449,10 @@ async fn http_accept_loop(
                         let resolver = resolver.clone();
                         tokio::spawn(async move {
                             let _permit = permit; // released when task completes
-                            if let Err(e) = handle_http(stream, &resolver).await {
-                                debug!("http proxy handler error: {e}");
+                            match timeout(HANDLER_TIMEOUT, handle_http(stream, &resolver)).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => debug!("http proxy handler error: {e}"),
+                                Err(_) => debug!("http proxy handler timed out"),
                             }
                         });
                     }
@@ -463,7 +499,18 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
     };
     let total = buf.len();
 
-    let request = String::from_utf8_lossy(&buf[..total]);
+    // Reject non-UTF-8 request bytes rather than silently replacing them with
+    // U+FFFD — replacement characters could mask crafted input from logs and
+    // from the method/target parsing that follows.
+    let request = match String::from_utf8(buf[..total].to_vec()) {
+        Ok(s) => s,
+        Err(_) => {
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await?;
+            anyhow::bail!("request contains non-UTF-8 bytes");
+        }
+    };
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
 
@@ -479,7 +526,7 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(target, 443)?;
-        debug!("http CONNECT {host}:{port}");
+        info!("http CONNECT {host}:{port}");
 
         match resolve_host(resolver, &host).await {
             Ok(ips) => match connect_any(&ips, port).await {
@@ -523,9 +570,21 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
                 .await?;
             return Ok(());
         }
+        // Reject plain-proxy requests that carry Transfer-Encoding alone.
+        // Forwarding chunked bodies verbatim (without decoding) lets the client
+        // control chunk-boundary framing; if the upstream reuses its TCP
+        // connection across requests the chunk boundaries can be used to
+        // smuggle a second request into the upstream's read buffer.
+        if has_transfer_encoding(&buf[..total]) {
+            warn!("http proxy rejected request with Transfer-Encoding");
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
         if let Some(url_host) = extract_host_from_url(target) {
             let (host, port) = parse_host_port(&url_host, 80)?;
-            debug!("http proxy {method} {host}:{port}");
+            info!("http proxy {method} {host}:{port}");
 
             match resolve_host(resolver, &host).await {
                 Ok(ips) => match connect_any(&ips, port).await {
@@ -620,6 +679,22 @@ fn has_cl_te_conflict(raw: &[u8]) -> bool {
         }
     }
     has_cl && has_te
+}
+
+/// Return true if the raw HTTP header block contains a `Transfer-Encoding` header.
+/// Used to reject plain-proxy requests with chunked bodies (see has_cl_te_conflict).
+fn has_transfer_encoding(raw: &[u8]) -> bool {
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(raw.len());
+    let Ok(text) = std::str::from_utf8(&raw[..end]) else {
+        return false;
+    };
+    text.lines().skip(1).any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding"))
+    })
 }
 
 /// Extract host:port from an absolute HTTP URL like "http://host:port/path".

@@ -1,5 +1,8 @@
 use std::path::PathBuf;
-
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::process::ExitCode;
 use ziplock::{dns, proxy, sandbox};
 
