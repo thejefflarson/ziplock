@@ -17,6 +17,14 @@ const MAX_CONNECTIONS: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for reading HTTP request headers (slow-loris mitigation).
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for the SOCKS5 handshake (auth negotiation + command read phases).
+/// A stalling client would otherwise pin a Tokio task and hold a semaphore permit
+/// indefinitely, eventually exhausting all MAX_CONNECTIONS permits.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum total duration for a proxied TCP tunnel. Without a cap, a sandboxed process
+/// can hold a connection open arbitrarily long, exhausting all semaphore permits and
+/// blocking every subsequent proxy connection.
+const TUNNEL_TIMEOUT: Duration = Duration::from_secs(3600);
 
 use crate::dns::TokioResolver;
 
@@ -333,14 +341,20 @@ async fn socks5_accept_loop(
 }
 
 async fn handle_socks5(stream: TcpStream, resolver: &TokioResolver) -> Result<()> {
-    // Use fast-socks5 for protocol handling (auth + command parsing)
-    let proto = Socks5ServerProtocol::accept_no_auth(stream)
-        .await
-        .context("socks5 auth negotiation failed")?;
+    // Use fast-socks5 for protocol handling (auth + command parsing).
+    // Each step is wrapped in HANDSHAKE_TIMEOUT: a stalling client must not pin a
+    // Tokio task and hold a semaphore permit indefinitely (finding: proxy.rs:335).
+    let proto = timeout(
+        HANDSHAKE_TIMEOUT,
+        Socks5ServerProtocol::accept_no_auth(stream),
+    )
+    .await
+    .context("socks5 auth negotiation timed out")?
+    .context("socks5 auth negotiation failed")?;
 
-    let (proto, cmd, target_addr) = proto
-        .read_command()
+    let (proto, cmd, target_addr) = timeout(HANDSHAKE_TIMEOUT, proto.read_command())
         .await
+        .context("socks5 read command timed out")?
         .context("socks5 read command failed")?;
 
     if !matches!(cmd, Socks5Command::TCPConnect) {
@@ -370,9 +384,14 @@ async fn handle_socks5(stream: TcpStream, resolver: &TokioResolver) -> Result<()
                     .reply_success(bound)
                     .await
                     .context("socks5 reply failed")?;
-                tokio::io::copy_bidirectional(&mut client_stream, &mut target_stream)
-                    .await
-                    .ok();
+                // Cap tunnel lifetime so a stalled connection cannot hold a semaphore
+                // permit open indefinitely and exhaust all MAX_CONNECTIONS slots.
+                timeout(
+                    TUNNEL_TIMEOUT,
+                    tokio::io::copy_bidirectional(&mut client_stream, &mut target_stream),
+                )
+                .await
+                .ok();
             }
             Err(e) => {
                 warn!("socks5 connect to {host}:{port} failed: {e}");
@@ -487,9 +506,12 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
                     stream
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         .await?;
-                    tokio::io::copy_bidirectional(&mut stream, &mut target_stream)
-                        .await
-                        .ok();
+                    timeout(
+                        TUNNEL_TIMEOUT,
+                        tokio::io::copy_bidirectional(&mut stream, &mut target_stream),
+                    )
+                    .await
+                    .ok();
                 }
                 Err(e) => {
                     warn!("http CONNECT to {host}:{port} failed: {e}");
@@ -535,9 +557,12 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
                         // causes virtual-host confusion on shared upstream servers.
                         let rewritten = rewrite_host_header(&buf[..total], &host, port, 80);
                         target_stream.write_all(&rewritten).await?;
-                        tokio::io::copy_bidirectional(&mut stream, &mut target_stream)
-                            .await
-                            .ok();
+                        timeout(
+                            TUNNEL_TIMEOUT,
+                            tokio::io::copy_bidirectional(&mut stream, &mut target_stream),
+                        )
+                        .await
+                        .ok();
                     }
                     Err(e) => {
                         warn!("http proxy to {host}:{port} failed: {e}");

@@ -113,7 +113,15 @@ fn sanitize_sbpl_path(path: &Path) -> Result<String> {
     // corrupt the profile: `"` terminates the literal, `\` is the escape
     // character, and control characters (including \n, \r) may cause
     // unpredictable parser behaviour or allow rule injection.
-    if s.contains('"') || s.contains('\\') || s.chars().any(|c| c.is_control()) {
+    // As defense-in-depth, also reject `;` (SBPL statement terminator) and `#`
+    // (SBPL comment introducer): these are rarely present in filesystem paths and
+    // are meaningful SBPL metacharacters outside string literals (finding: sandbox.rs:107).
+    if s.contains('"')
+        || s.contains('\\')
+        || s.contains(';')
+        || s.contains('#')
+        || s.chars().any(|c| c.is_control())
+    {
         anyhow::bail!(
             "path contains characters unsafe for sandbox profile: {}",
             path.display()
@@ -632,9 +640,14 @@ fn find_1password_dirs(home: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
         // `evil.1password.exfil` from triggering a write carve-out.
         // Legitimate 1Password Group Container names end with `.1password`,
         // `.agilebits`, or `.onepassword` (bundle ID suffix pattern TEAMID.com.NAME).
-        if name.ends_with(".1password")
-            || name.ends_with(".agilebits")
-            || name.ends_with(".onepassword")
+        // Also require at least 2 dots to enforce the TEAMID.com.NAME structure:
+        // a prompt-injected `mkdir evil.1password` yields only 1 dot and is rejected,
+        // while `2BUA8C4S2C.com.1password` (2 dots) passes (finding: sandbox.rs:635).
+        let dot_count = name.matches('.').count();
+        if dot_count >= 2
+            && (name.ends_with(".1password")
+                || name.ends_with(".agilebits")
+                || name.ends_with(".onepassword"))
         {
             let path = entry.path();
             // Canonicalize to resolve any symlinks before interpolating into the SBPL profile.
@@ -784,12 +797,16 @@ pub fn spawn_claude(
         cmd.env("TMPDIR", &tmp_claude);
     }
 
-    // Apply sandbox in pre_exec (after fork, before exec)
-    let profile_for_closure = profile.clone();
+    // Apply sandbox in pre_exec (after fork, before exec).
+    // SAFETY: pre-allocate the CString *before* fork so the pre_exec closure does not
+    // call malloc() in the child of a multi-threaded Tokio process. Calling malloc()
+    // after fork in the child is not async-signal-safe and will deadlock if any Tokio
+    // worker thread held the allocator lock at the time of fork (finding: sandbox.rs:790).
+    // The CString is moved into the closure and its pointer is valid until after exec.
+    let profile_cstr = CString::new(profile.as_bytes())
+        .context("sandbox profile contains a null byte")?;
     unsafe {
         cmd.pre_exec(move || {
-            let profile_cstr =
-                CString::new(profile_for_closure.as_bytes()).map_err(std::io::Error::other)?;
             let mut errorbuf: *mut c_char = std::ptr::null_mut();
             let ret = sandbox_init(profile_cstr.as_ptr(), 0, &mut errorbuf);
             if ret != 0 {

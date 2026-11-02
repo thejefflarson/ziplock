@@ -130,6 +130,20 @@ async fn run() -> Result<ExitCode> {
     log_opts.create(true).append(true);
     #[cfg(unix)]
     log_opts.mode(0o600);
+    // Refuse to follow a symlink at the log path. A symlink planted by a local attacker
+    // would redirect log data (which contains accessed hostnames) to an arbitrary file.
+    // This check reduces the TOCTOU window; rotate_log_if_large() already refuses to
+    // rename a symlink, so the path should be a regular file or absent at this point
+    // (finding: main.rs:133).
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::symlink_metadata(&log_file_path) {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "log file at {} is a symlink; refusing to follow (potential log-redirect attack)",
+                log_file_path.display()
+            );
+        }
+    }
     let log_file = log_opts
         .open(&log_file_path)
         .context("failed to open log file")?;
