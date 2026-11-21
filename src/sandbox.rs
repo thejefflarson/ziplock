@@ -662,10 +662,10 @@ fn find_1password_dirs(home: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
                 // Use symlink_metadata (lstat) to avoid following a symlink at the socket path.
                 // sock.exists() follows symlinks — a symlink at agent.sock would cause the
                 // symlinked directory to be added as a sandbox write carve-out.
-                if let Ok(meta) = std::fs::symlink_metadata(&sock) {
-                    if meta.file_type().is_socket() || meta.is_file() {
-                        agent_dir = sock.parent().map(|p| p.to_path_buf());
-                    }
+                if let Ok(meta) = std::fs::symlink_metadata(&sock)
+                    && (meta.file_type().is_socket() || meta.is_file())
+                {
+                    agent_dir = sock.parent().map(|p| p.to_path_buf());
                 }
             }
             containers.push(canonical);
@@ -803,8 +803,8 @@ pub fn spawn_claude(
     // after fork in the child is not async-signal-safe and will deadlock if any Tokio
     // worker thread held the allocator lock at the time of fork (finding: sandbox.rs:790).
     // The CString is moved into the closure and its pointer is valid until after exec.
-    let profile_cstr = CString::new(profile.as_bytes())
-        .context("sandbox profile contains a null byte")?;
+    let profile_cstr =
+        CString::new(profile.as_bytes()).context("sandbox profile contains a null byte")?;
     unsafe {
         cmd.pre_exec(move || {
             let mut errorbuf: *mut c_char = std::ptr::null_mut();

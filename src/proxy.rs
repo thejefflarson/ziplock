@@ -143,10 +143,7 @@ pub(crate) fn is_blocked_ip(ip: &IpAddr) -> bool {
         IpAddr::V4(v4) => *v4 == Ipv4Addr::UNSPECIFIED,
         IpAddr::V6(v6) => {
             // Also catch the IPv4-mapped form ::ffff:0.0.0.0
-            v6.is_unspecified()
-                || v6
-                    .to_ipv4_mapped()
-                    .map_or(false, |v4| v4 == Ipv4Addr::UNSPECIFIED)
+            v6.is_unspecified() || v6.to_ipv4_mapped() == Some(Ipv4Addr::UNSPECIFIED)
         }
     }
 }
