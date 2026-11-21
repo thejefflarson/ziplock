@@ -136,13 +136,13 @@ async fn run() -> Result<ExitCode> {
     // rename a symlink, so the path should be a regular file or absent at this point
     // (finding: main.rs:133).
     #[cfg(unix)]
-    if let Ok(meta) = std::fs::symlink_metadata(&log_file_path) {
-        if meta.file_type().is_symlink() {
-            bail!(
-                "log file at {} is a symlink; refusing to follow (potential log-redirect attack)",
-                log_file_path.display()
-            );
-        }
+    if let Ok(meta) = std::fs::symlink_metadata(&log_file_path)
+        && meta.file_type().is_symlink()
+    {
+        bail!(
+            "log file at {} is a symlink; refusing to follow (potential log-redirect attack)",
+            log_file_path.display()
+        );
     }
     let log_file = log_opts
         .open(&log_file_path)
