@@ -572,6 +572,10 @@ pub fn generate_profile(
 ;; lsopen: required for `open MyApp.app` (dev workflow: build → kill → install → open)
 ;; and Claude Code's OAuth browser launch. Residual risk: prompt injection could open a
 ;; browser to an attacker URL; mitigated by DNS proxy blocking malicious domains.
+;; Accepted risk (see CLAUDE.md design note): an app launched via lsopen runs OUTSIDE the
+;; sandbox, so opening a prompt-injected `.command`/app written to $HOME can read the
+;; ~/Library data the profile denies — the same escape-to-unsandboxed-execution class as
+;; writable $HOME. Accepted: `open` is core dev-tool/OAuth functionality, so the allow stands.
 (allow lsopen)
 ;; Note: /bin/ps and /usr/bin/top are setuid-root binaries — the macOS sandbox blocks
 ;; setuid execution unconditionally regardless of SBPL rules. process-info* (declared
