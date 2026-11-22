@@ -190,6 +190,10 @@ pub fn generate_profile(
   ;; socket, and XPC services that back Mach ports.
   ;; Inbound and bind are intentionally omitted: Claude is a client, not a server;
   ;; allowing it to bind and accept on unix sockets creates covert exfiltration channels.
+  ;; Accepted risk (see CLAUDE.md design note): this also reaches a container-runtime
+  ;; daemon socket (Docker/colima/OrbStack/podman) if present, i.e. host escape. Narrowing
+  ;; to specific paths would break the XPC/Mach-backing sockets above; for a developer tool
+  ;; run by the developer, container access is in scope, so the broad allow stands.
   (allow network-outbound (remote unix-socket))"#
             .to_string()
     };
@@ -210,6 +214,11 @@ pub fn generate_profile(
 (allow signal)
 
 ;; ── File reads: allow most, deny sensitive system trees ──────────────────
+;; Accepted risk (see CLAUDE.md design note): this leaves credential files under $HOME
+;; (~/.aws, ~/.ssh, ~/.netrc, ~/.gnupg, …) readable and thus exfiltratable via any
+;; non-malware host — the proxy filters malware/adult domains, it is not a DLP. Broad read
+;; access is the point of a developer tool, and the exfil path exists through many channels
+;; regardless, so the broad allow stands rather than denying credential directories.
 (allow file-read*)
 
 ;; Deny sensitive system locations
@@ -308,6 +317,13 @@ pub fn generate_profile(
 ;;   granting write access to /private/var/db, /private/var/log, etc.
 ;; /private/var/tmp: secondary temp directory used by xcodebuild for test session
 ;;   logarchives (written to /var/tmp which resolves to /private/var/tmp).
+;;
+;; Accepted risk (see CLAUDE.md design note): the $HOME subpath write leaves shell
+;; startup and tool config files writable (~/.zshrc, ~/.bashrc, ~/.gitconfig,
+;; ~/.ssh/authorized_keys, ~/.config/fish/config.fish, …), which run unsandboxed on the
+;; next shell/git/ssh invocation — a persistence escape. A write-wide $HOME is load-bearing
+;; for a developer tool (editors, LSP plugins, and CLI tools write throughout $HOME), so the
+;; broad allow stands rather than denying individual rc/config files.
 (allow file-write* file-clone file-link
     (subpath "{cwd_str}")
     (subpath "{home_str}")
