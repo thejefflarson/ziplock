@@ -670,9 +670,13 @@ fn find_1password_dirs(home: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
                 || name.ends_with(".onepassword"))
         {
             let path = entry.path();
-            // Canonicalize to resolve any symlinks before interpolating into the SBPL profile.
-            // A symlink at ~/Library/Group Containers/evil.1password -> /sensitive would
-            // otherwise grant file-write* to the symlink target.
+            // Canonicalize so the SBPL rule names the real target and dangling symlinks
+            // are dropped (the Err arm below). This does NOT stop a planted
+            // `evil.1password -> /sensitive` symlink from exposing its target: SBPL
+            // resolves symlinks before matching, so the grant lands on /sensitive either
+            // way. That is gated instead by the name check above and by the fact that
+            // planting anything in ~/Library/Group Containers already needs the user's own
+            // out-of-sandbox privileges — this code runs before the sandbox is applied.
             let canonical = match std::fs::canonicalize(&path) {
                 Ok(c) => c,
                 Err(_) => continue, // skip unresolvable paths
