@@ -22,6 +22,9 @@ use std::process::Command;
 unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
     fn sandbox_free_error(errorbuf: *mut c_char);
+    /// APFS copy-on-write clone (`clonefile(2)`); used to probe whether the sandbox
+    /// denies cloning a read-denied ~/Library source.
+    fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> c_int;
 }
 
 /// Test: sandboxed process can write inside CWD and $HOME, cannot write to ~/Library or /etc.
@@ -326,6 +329,172 @@ fn sandboxed_read_permissions() {
                 WaitStatus::Exited(_, code) => panic!("child exited with code {code}"),
                 other => panic!("child exited abnormally: {other:?}"),
             }
+        }
+    }
+}
+
+/// Walk ~/Library for a regular file the sandbox profile denies reading (outside the
+/// read carve-outs) that is still readable by this unsandboxed test process, to use as a
+/// clone/hard-link source. Returns the first match within a bounded depth, or None.
+fn find_read_denied_library_file(home: &Path) -> Option<String> {
+    // Top-level ~/Library names that ARE read carve-outs in the profile — skip them so the
+    // source is genuinely read-denied. "Application Support" is skipped wholesale because it
+    // has carved subdirs (go, k9s, Ollama, …); any denied file elsewhere serves the probe.
+    const CARVED: &[&str] = &[
+        "Preferences",
+        "Caches",
+        "Keychains",
+        "Developer",
+        "org.swift.swiftpm",
+        "Security",
+        "helm",
+        "Jupyter",
+        "Group Containers",
+        "Application Support",
+    ];
+    fn walk(dir: &Path, depth: u32) -> Option<String> {
+        if depth == 0 {
+            return None;
+        }
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            let ft = entry.file_type().ok()?;
+            // Readable by this process (not TCC-blocked / not a dangling link)?
+            if ft.is_file() && std::fs::File::open(&path).is_ok() {
+                return Some(path.to_string_lossy().into_owned());
+            } else if ft.is_dir()
+                && let Some(found) = walk(&path, depth - 1)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let library = home.join("Library");
+    for entry in std::fs::read_dir(&library).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if CARVED.contains(&name.as_str()) {
+            continue;
+        }
+        if entry.file_type().ok()?.is_dir()
+            && let Some(found) = walk(&entry.path(), 3)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Regression: the ~/Library *read* deny must not be bypassable by hard-linking or
+/// cloning (`clonefile`) a ~/Library file to a readable path and reading the copy.
+/// `file-clone`/`file-link` are allowed broadly under $HOME; this verifies the kernel
+/// also denies the operation when the *source* is a read-denied ~/Library path, so a
+/// sandboxed process cannot launder browser/Messages/other-app secrets out of ~/Library.
+#[test]
+fn sandbox_blocks_library_read_via_hardlink_and_clone() {
+    if common::already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap();
+
+    // Find a readable-outside regular file under a ~/Library subtree that our profile
+    // *denies* reading — i.e. not one of the read carve-outs (Preferences, Caches,
+    // Keychains, Developer, …) and not a TCC-protected dir the test can't enumerate
+    // anyway. This mirrors the finding's real targets (browser/Messages/other-app data).
+    // Without one the test can't conclude — skip.
+    let source = find_read_denied_library_file(Path::new(&home));
+    let Some(source) = source else {
+        eprintln!("skipping: no readable, read-denied ~/Library file available as a source");
+        return;
+    };
+
+    let cwd = Path::new("/tmp/ziplock-e2e-linkbypass");
+    std::fs::create_dir_all(cwd).ok();
+    let profile =
+        ziplock::sandbox::generate_profile(cwd, Path::new(&home), &[], true, None, &[]).unwrap();
+
+    let dst_link = cwd.join("hardlink_copy");
+    let dst_clone = cwd.join("clone_copy");
+    std::fs::remove_file(&dst_link).ok();
+    std::fs::remove_file(&dst_clone).ok();
+
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
+
+    let (src_c, link_c, clone_c) = (
+        source.clone(),
+        dst_link.to_string_lossy().into_owned(),
+        dst_clone.to_string_lossy().into_owned(),
+    );
+
+    match unsafe { nix::unistd::fork() }.expect("fork failed") {
+        nix::unistd::ForkResult::Child => {
+            common::apply_sandbox(&profile).unwrap_or_else(|e| {
+                eprintln!("sandbox_init failed: {e}");
+                std::process::exit(99);
+            });
+
+            // (bit0) Direct read of the ~/Library source must be denied — sanity that the
+            // control under test is actually active for this source.
+            let direct_denied = std::fs::read(&src_c).is_err();
+
+            // (bit1) hard_link succeeded; (bit2) and the copy's contents were disclosed.
+            let hl = std::fs::hard_link(&src_c, &link_c);
+            let hl_ok = hl.is_ok();
+            let hl_disclosed = hl_ok
+                && std::fs::read(&link_c)
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false);
+
+            // (bit3) clonefile succeeded; (bit4) and the copy's contents were disclosed.
+            let src_cstr = CString::new(src_c.as_bytes()).unwrap();
+            let clone_cstr = CString::new(clone_c.as_bytes()).unwrap();
+            let cl_ret = unsafe { clonefile(src_cstr.as_ptr(), clone_cstr.as_ptr(), 0) };
+            let cl_ok = cl_ret == 0;
+            let cl_disclosed = cl_ok
+                && std::fs::read(&clone_c)
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false);
+
+            std::fs::remove_file(&link_c).ok();
+            std::fs::remove_file(&clone_c).ok();
+
+            let code = (direct_denied as i32)
+                | ((hl_ok as i32) << 1)
+                | ((hl_disclosed as i32) << 2)
+                | ((cl_ok as i32) << 3)
+                | ((cl_disclosed as i32) << 4);
+            std::process::exit(code);
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            use nix::sys::wait::WaitStatus;
+            std::fs::remove_file(&dst_link).ok();
+            std::fs::remove_file(&dst_clone).ok();
+            let code = match nix::sys::wait::waitpid(child, None).expect("waitpid failed") {
+                WaitStatus::Exited(_, 99) => panic!("sandbox_init failed in child"),
+                WaitStatus::Exited(_, c) => c,
+                other => panic!("child exited abnormally: {other:?}"),
+            };
+            eprintln!(
+                "probe source={source} outcome_bits={code:#07b} (b0 direct-denied, b1 hardlink-ok, b2 hl-disclosed, b3 clone-ok, b4 clone-disclosed)"
+            );
+            if code & 0b1 == 0 {
+                eprintln!(
+                    "skipping: source was readable under the sandbox (carve-out?); inconclusive"
+                );
+                return;
+            }
+            let hl_disclosed = code & 0b100 != 0;
+            let cl_disclosed = code & 0b10000 != 0;
+            assert!(
+                !hl_disclosed,
+                "SECURITY: ~/Library file contents disclosed via hard link (code={code:#07b})"
+            );
+            assert!(
+                !cl_disclosed,
+                "SECURITY: ~/Library file contents disclosed via clonefile (code={code:#07b})"
+            );
         }
     }
 }
