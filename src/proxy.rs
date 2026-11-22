@@ -108,15 +108,27 @@ pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
                 );
                 return is_private_v4(&embedded);
             }
+            // NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052): the low 32 bits embed the
+            // IPv4 address the kernel routes to on a NAT64 network. Classify by that embedded
+            // address, so a NAT64 literal wrapping a public IPv4 (e.g. 64:ff9b::8.8.8.8) stays
+            // blocked and is forced through the DoH filter, while a wrapped private target is
+            // still reachable — same treatment as the IPv4-translated branch above.
+            if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0
+            {
+                let embedded = std::net::Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    s[6] as u8,
+                    (s[7] >> 8) as u8,
+                    s[7] as u8,
+                );
+                return is_private_v4(&embedded);
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || (s[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
                 || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
                 || (s[0] & 0xff00) == 0xff00 // multicast ff00::/8
                 || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
-                // NAT64 Well-Known Prefix 64:ff9b::/96 and local-use 64:ff9b:1::/48 (RFC 6052, 8215).
-                // DoH AAAA records using these prefixes synthesize private IPv4 targets.
-                || (s[0] == 0x0064 && s[1] == 0xff9b)
         }
     }
 }
@@ -528,17 +540,31 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
             }
         }
     } else {
-        // Plain HTTP proxy: GET http://host/path HTTP/1.1
+        // Plain-HTTP forward proxy: GET http://host/path HTTP/1.1
         //
-        // The raw request headers are forwarded verbatim, so before forwarding
-        // we reject any request that carries both Content-Length and
-        // Transfer-Encoding headers — the CL:TE ambiguity is the canonical
-        // request-smuggling primitive. Real clients (curl, Bun, node) don't
-        // emit both; a request that does is almost certainly crafted.
+        // We forward exactly ONE request per client connection and relay only its response,
+        // then close. A keep-alive client could otherwise pipeline a second request with a
+        // different Host onto the same upstream socket; a blind bidirectional relay would
+        // forward it verbatim, reaching a name that shares the allowed host's IP (common on
+        // CDNs) without ever passing the DoH filter. One request per connection keeps the
+        // invariant "every forwarded request's host was filtered" true.
+        //
+        // The raw request headers are forwarded verbatim, so we first reject any request
+        // carrying both Content-Length and Transfer-Encoding — the CL:TE ambiguity is the
+        // canonical request-smuggling primitive. A lone chunked request body is rejected too:
+        // framing it to find the request boundary would reintroduce that surface, and real
+        // forward-proxy clients (curl, Bun, node) send Content-Length instead.
         if has_cl_te_conflict(&buf[..total]) {
             warn!("http proxy rejected request with both Content-Length and Transfer-Encoding");
             stream
                 .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
+        if has_chunked_request_body(&buf[..total]) {
+            warn!("http proxy rejected chunked request body (unsupported on the forward path)");
+            stream
+                .write_all(b"HTTP/1.1 411 Length Required\r\n\r\n")
                 .await?;
             return Ok(());
         }
@@ -549,14 +575,40 @@ async fn handle_http(mut stream: TcpStream, resolver: &TokioResolver) -> Result<
             match resolve_host(resolver, &host).await {
                 Ok(ips) => match connect_any(&ips, port).await {
                     Ok(mut target_stream) => {
-                        // Rewrite the client-supplied Host header to the DNS-resolved authority.
-                        // Without this, a crafted Host: header that differs from the URL host
-                        // causes virtual-host confusion on shared upstream servers.
-                        let rewritten = rewrite_host_header(&buf[..total], &host, port, 80);
+                        // read_http_headers stops at the first \r\n\r\n but may have buffered a
+                        // pipelined follow-up request; trim to the first request's framing so
+                        // only it (headers + its declared body) reaches the upstream.
+                        let header_end = buf[..total]
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                            .unwrap_or(total);
+                        let content_length =
+                            request_content_length(&buf[..total]).unwrap_or(0) as usize;
+                        let body_in_buf = total - header_end;
+                        let first_request_end = header_end + body_in_buf.min(content_length);
+                        let remaining_body = content_length.saturating_sub(body_in_buf) as u64;
+
+                        // Rewrite the client Host header to the DNS-resolved authority (defeats
+                        // virtual-host confusion where a crafted Host differs from the URL host)
+                        // and force Connection: close so the upstream ends the connection after
+                        // one response.
+                        let rewritten =
+                            rewrite_request_headers(&buf[..first_request_end], &host, port, 80);
                         target_stream.write_all(&rewritten).await?;
+
+                        // Forward only this request's remaining declared body, then half-close
+                        // the write side so the upstream sees the request end. The client is
+                        // never read again, so a pipelined second request is dropped.
+                        let _ = timeout(
+                            TUNNEL_TIMEOUT,
+                            forward_remaining_body(&mut stream, &mut target_stream, remaining_body),
+                        )
+                        .await;
+                        let _ = target_stream.shutdown().await;
                         timeout(
                             TUNNEL_TIMEOUT,
-                            tokio::io::copy_bidirectional(&mut stream, &mut target_stream),
+                            tokio::io::copy(&mut target_stream, &mut stream),
                         )
                         .await
                         .ok();
@@ -644,6 +696,62 @@ fn has_cl_te_conflict(raw: &[u8]) -> bool {
     has_cl && has_te
 }
 
+/// Parse the request's `Content-Length` header, if present and a valid integer.
+/// Scans only the header region (through the first `\r\n\r\n`).
+fn request_content_length(raw: &[u8]) -> Option<u64> {
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(raw.len());
+    let text = std::str::from_utf8(&raw[..end]).ok()?;
+    text.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+/// Return true if the request declares a non-empty `Transfer-Encoding` body (e.g. chunked).
+/// The forward path does not frame chunked request bodies, so such requests are rejected
+/// rather than relayed with an unknown boundary.
+fn has_chunked_request_body(raw: &[u8]) -> bool {
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(raw.len());
+    let Ok(text) = std::str::from_utf8(&raw[..end]) else {
+        return false;
+    };
+    text.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(n, v)| {
+            n.trim().eq_ignore_ascii_case("transfer-encoding") && !v.trim().is_empty()
+        })
+    })
+}
+
+/// Stream exactly `remaining` request-body bytes from `client` to `upstream`, stopping at
+/// `remaining` or an early client EOF. Bounding the copy to the declared body length means
+/// a pipelined follow-up request that trails the body is never forwarded.
+async fn forward_remaining_body(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    mut remaining: u64,
+) -> Result<()> {
+    let mut buf = [0u8; 8192];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = client.read(&mut buf[..want]).await?;
+        if n == 0 {
+            break;
+        }
+        upstream.write_all(&buf[..n]).await?;
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
 /// Extract host:port from an absolute HTTP URL like "http://host:port/path".
 ///
 /// Only `http://` is accepted — silently forwarding `https://` plain-text would
@@ -663,12 +771,19 @@ fn extract_host_from_url(url: &str) -> Option<String> {
     Some(host_port.to_string())
 }
 
-/// Rewrite the `Host` header in a raw HTTP request to the canonical authority used for
-/// DNS resolution.  This prevents virtual-host confusion where a client-supplied Host
-/// header differs from the URL authority (e.g. `http://real.com/` with `Host: evil.com`).
+/// Rewrite a raw HTTP request for single-shot forwarding: set the `Host` header to the
+/// canonical DNS-resolved authority (preventing virtual-host confusion where a client Host
+/// differs from the URL authority, e.g. `http://real.com/` with `Host: evil.com`), drop any
+/// client `Connection`/`Proxy-Connection` header, and append `Connection: close` so the
+/// upstream ends the connection after one response.
 ///
 /// Only the header section (before `\r\n\r\n`) is touched; the body is forwarded verbatim.
-fn rewrite_host_header(raw: &[u8], canonical_host: &str, port: u16, default_port: u16) -> Vec<u8> {
+fn rewrite_request_headers(
+    raw: &[u8],
+    canonical_host: &str,
+    port: u16,
+    default_port: u16,
+) -> Vec<u8> {
     let canonical = if port == default_port {
         canonical_host.to_string()
     } else {
@@ -681,8 +796,12 @@ fn rewrite_host_header(raw: &[u8], canonical_host: &str, port: u16, default_port
     let Ok(header_str) = std::str::from_utf8(&raw[..sep]) else {
         return raw.to_vec();
     };
-    let rewritten: String = header_str
+    let mut lines: Vec<String> = header_str
         .split("\r\n")
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            !(lower.starts_with("connection:") || lower.starts_with("proxy-connection:"))
+        })
         .map(|line| {
             if line.to_ascii_lowercase().starts_with("host:") {
                 format!("Host: {canonical}")
@@ -690,9 +809,9 @@ fn rewrite_host_header(raw: &[u8], canonical_host: &str, port: u16, default_port
                 line.to_string()
             }
         })
-        .collect::<Vec<_>>()
-        .join("\r\n");
-    let mut out = rewritten.into_bytes();
+        .collect();
+    lines.push("Connection: close".to_string());
+    let mut out = lines.join("\r\n").into_bytes();
     out.extend_from_slice(&raw[sep..]); // includes \r\n\r\n and body
     out
 }
@@ -754,6 +873,22 @@ mod tests {
         )));
         assert!(!is_private_ip(&IpAddr::V6(
             "::ffff:8.8.8.8".parse().unwrap()
+        )));
+
+        // NAT64 well-known prefix 64:ff9b::/96 is classified by its embedded IPv4, not
+        // treated as private wholesale: a wrapped public address must stay blocked so it
+        // can't skip the DoH malware filter, while a wrapped private target stays reachable.
+        assert!(!is_private_ip(&IpAddr::V6(
+            "64:ff9b::808:808".parse().unwrap() // embeds 8.8.8.8 (public)
+        )));
+        assert!(!is_private_ip(&IpAddr::V6(
+            "64:ff9b::101:101".parse().unwrap() // embeds 1.1.1.1 (public)
+        )));
+        assert!(is_private_ip(&IpAddr::V6(
+            "64:ff9b::c0a8:2801".parse().unwrap() // embeds 192.168.40.1 (private)
+        )));
+        assert!(is_private_ip(&IpAddr::V6(
+            "64:ff9b::a00:1".parse().unwrap() // embeds 10.0.0.1 (private)
         )));
 
         // CGNAT (100.64.0.0/10)
@@ -875,6 +1010,123 @@ mod tests {
         let poisoned_body =
             b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nTransfer-Encoding: chunked";
         assert!(!has_cl_te_conflict(poisoned_body));
+    }
+
+    #[test]
+    fn request_content_length_parses_header() {
+        let req = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\n\r\n";
+        assert_eq!(request_content_length(req), Some(42));
+        // Case-insensitive name, trimmed value.
+        let req = b"POST /x HTTP/1.1\r\nHost: x\r\nCONTENT-LENGTH:  7 \r\n\r\n";
+        assert_eq!(request_content_length(req), Some(7));
+        // Absent → None (treated as no body).
+        let req = b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(request_content_length(req), None);
+        // Non-numeric → None.
+        let req = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
+        assert_eq!(request_content_length(req), None);
+    }
+
+    #[test]
+    fn has_chunked_request_body_detects_transfer_encoding() {
+        assert!(has_chunked_request_body(
+            b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+        ));
+        assert!(!has_chunked_request_body(
+            b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\n"
+        ));
+        // Empty value doesn't count.
+        assert!(!has_chunked_request_body(
+            b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: \r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn rewrite_request_headers_forces_connection_close() {
+        let req =
+            b"GET http://real.com/ HTTP/1.1\r\nHost: evil.com\r\nConnection: keep-alive\r\n\r\n";
+        let out = rewrite_request_headers(req, "real.com", 80, 80);
+        let text = String::from_utf8(out).unwrap();
+        // Host rewritten to the resolved authority, client keep-alive dropped, close appended.
+        assert!(text.contains("Host: real.com"), "{text:?}");
+        assert!(
+            !text.to_ascii_lowercase().contains("keep-alive"),
+            "{text:?}"
+        );
+        assert_eq!(
+            text.matches("Connection: close").count(),
+            1,
+            "exactly one forced close header: {text:?}"
+        );
+        assert!(text.ends_with("\r\n\r\n"), "framing preserved: {text:?}");
+    }
+
+    /// Regression (SSRF / DoH-filter bypass): a pipelined second request with a different
+    /// Host must NOT reach the upstream. Before the one-request-per-connection fix, the
+    /// plain-HTTP path filtered only the first request and bidirectionally relayed the rest,
+    /// so a CDN-colocated malware name sharing the allowed host's IP slipped past the filter.
+    #[tokio::test]
+    async fn http_proxy_forwards_only_first_pipelined_request() {
+        // Fake upstream: accept one connection, read until EOF, reply, report received bytes.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = upstream.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut b = [0u8; 4096];
+            loop {
+                match sock.read(&mut b).await {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&b[..n]),
+                    Err(_) => break,
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                .await;
+            let _ = sock.shutdown().await;
+            let _ = tx.send(got);
+        });
+
+        // Proxy front: accept the client connection and hand it to handle_http.
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let resolver = crate::dns::create_resolver().unwrap();
+        tokio::spawn(async move {
+            let (server_side, _) = front.accept().await.unwrap();
+            let _ = handle_http(server_side, &resolver).await;
+        });
+
+        // Client pipelines two requests on one connection; the second targets a different Host.
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
+        let pipelined = format!(
+            "GET http://127.0.0.1:{up}/allowed HTTP/1.1\r\nHost: 127.0.0.1:{up}\r\nConnection: keep-alive\r\n\r\n\
+             GET http://127.0.0.1:{up}/smuggled HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+            up = up_port
+        );
+        client.write_all(pipelined.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        let _ = timeout(Duration::from_secs(5), client.read_to_end(&mut resp)).await;
+
+        let got = timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+        let got = String::from_utf8_lossy(&got);
+        assert!(
+            got.contains("/allowed"),
+            "first request should reach upstream: {got:?}"
+        );
+        assert!(
+            !got.contains("/smuggled"),
+            "pipelined second request must NOT reach upstream: {got:?}"
+        );
+        assert!(
+            !got.contains("evil.example"),
+            "smuggled Host must NOT reach upstream: {got:?}"
+        );
+        assert!(
+            got.contains("Connection: close"),
+            "forwarded request must force Connection: close: {got:?}"
+        );
     }
 
     #[test]
