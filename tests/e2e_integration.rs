@@ -568,3 +568,118 @@ fn sandboxed_helm_config_and_data_homes() {
         }
     }
 }
+
+/// A sandboxed session must be able to create unix-domain listeners — binding and serving
+/// a unix socket is ordinary developer work, and the Claude Code IPC mesh advertises each
+/// session as a listener at /tmp/cc-socks/<pid>.sock. The profile allows unix bind+accept
+/// (and loopback TCP listeners). Each outcome is a bit in the child exit code; all expected
+/// SET.
+///
+/// bit0 (A) loopback TCP listener        — expect SET
+/// bit1 (B) unix listener in $TMPDIR     — expect SET (unix bind allowed anywhere)
+/// bit2 (C) unix listener in cc-socks    — expect SET (the real mesh-advertisement path)
+#[test]
+fn sandbox_allows_unix_domain_listeners() {
+    if common::already_sandboxed() {
+        eprintln!("skipping: already running inside a sandbox");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap();
+    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+    let cc_socks = "/tmp/cc-socks";
+    // Pre-create the mesh dir (0700) so binding has somewhere to land; matches how Claude
+    // Code sets it up. Harmless if it already exists from a live session.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(cc_socks)
+            .ok();
+    }
+    let cwd = "/tmp/ziplock-sockprobe";
+    std::fs::create_dir_all(cwd).ok();
+    let profile =
+        ziplock::sandbox::generate_profile(Path::new(cwd), Path::new(&home), &[], false, None, &[])
+            .unwrap();
+
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
+
+    let pid = std::process::id();
+    match unsafe { nix::unistd::fork() }.expect("fork failed") {
+        nix::unistd::ForkResult::Child => {
+            common::apply_sandbox(&profile).unwrap_or_else(|e| {
+                eprintln!("sandbox_init failed: {e}");
+                std::process::exit(99);
+            });
+            let mut bits = 0u8;
+
+            // (A) loopback TCP listener.
+            match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => {
+                    bits |= 1;
+                    eprintln!("A TCP 127.0.0.1:0 listen: OK ({})", l.local_addr().unwrap());
+                }
+                Err(e) => eprintln!(
+                    "A TCP 127.0.0.1:0 listen: ERR {e} (errno={:?})",
+                    e.raw_os_error()
+                ),
+            }
+
+            // (B) unix listener in $TMPDIR (a normal writable temp dir).
+            let outside = format!("{tmpdir}/ziplock-sockprobe-{pid}.sock");
+            std::fs::remove_file(&outside).ok();
+            match std::os::unix::net::UnixListener::bind(&outside) {
+                Ok(_) => {
+                    bits |= 2;
+                    eprintln!("B unix listener $TMPDIR: OK ({outside})");
+                    std::fs::remove_file(&outside).ok();
+                }
+                Err(e) => eprintln!(
+                    "B unix listener $TMPDIR: ERR {e} (errno={:?})",
+                    e.raw_os_error()
+                ),
+            }
+
+            // (C) unix listener in cc-socks — the real mesh-advertisement path.
+            let sock = format!("{cc_socks}/ziplock-sockprobe-{pid}.sock");
+            std::fs::remove_file(&sock).ok();
+            match std::os::unix::net::UnixListener::bind(&sock) {
+                Ok(_) => {
+                    bits |= 4;
+                    eprintln!("C unix listener cc-socks: OK ({sock})");
+                    std::fs::remove_file(&sock).ok();
+                }
+                Err(e) => eprintln!(
+                    "C unix listener cc-socks: ERR {e} (errno={:?})",
+                    e.raw_os_error()
+                ),
+            }
+
+            std::process::exit(bits as i32);
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            use nix::sys::wait::WaitStatus;
+            match nix::sys::wait::waitpid(child, None).expect("waitpid failed") {
+                WaitStatus::Exited(_, 99) => panic!("sandbox_init failed in child"),
+                WaitStatus::Exited(_, code) => {
+                    let b = code as u8;
+                    eprintln!(
+                        "result bits={b:#05b}  tcp-listen={}  tmpdir-unix-listen={}  cc-socks-unix-listen={}",
+                        b & 1 != 0,
+                        b & 2 != 0,
+                        b & 4 != 0
+                    );
+                    assert!(b & 1 != 0, "loopback TCP listener should be allowed");
+                    assert!(b & 2 != 0, "unix listener in $TMPDIR should be allowed");
+                    assert!(
+                        b & 4 != 0,
+                        "unix listener in cc-socks should be allowed (mesh advertisement)"
+                    );
+                }
+                other => panic!("child exited abnormally: {other:?}"),
+            }
+        }
+    }
+}

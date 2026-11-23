@@ -188,13 +188,19 @@ pub fn generate_profile(
   ;; Allow outbound unix domain socket connections.
   ;; Required for mDNSResponder (/var/run/mDNSResponder), the 1Password SSH agent
   ;; socket, and XPC services that back Mach ports.
-  ;; Inbound and bind are intentionally omitted: Claude is a client, not a server;
-  ;; allowing it to bind and accept on unix sockets creates covert exfiltration channels.
-  ;; Accepted risk (see CLAUDE.md design note): this also reaches a container-runtime
-  ;; daemon socket (Docker/colima/OrbStack/podman) if present, i.e. host escape. Narrowing
-  ;; to specific paths would break the XPC/Mach-backing sockets above; for a developer tool
-  ;; run by the developer, container access is in scope, so the broad allow stands.
-  (allow network-outbound (remote unix-socket))"#
+  ;; Unix-domain sockets: allow outbound connect plus bind/accept. Binding and serving a
+  ;; unix socket is ordinary developer work, and the Claude Code multi-session IPC mesh
+  ;; needs it specifically — each session advertises as a listener at
+  ;; /tmp/cc-socks/<pid>.sock, so without bind/accept a sandboxed session is invisible to
+  ;; peers (no discovery, no SendMessage). An earlier profile denied bind/accept as a
+  ;; "covert exfiltration channel," but that closed nothing: loopback-TCP bind+accept and
+  ;; outbound unix connect to any socket are already allowed and are equivalent channels.
+  ;; Accepted risk (see CLAUDE.md design note): outbound reaches a container-runtime daemon
+  ;; socket (Docker/colima/OrbStack/podman) if present, i.e. host escape. For a developer
+  ;; tool run by the developer, container access is in scope, so the allow stands.
+  (allow network-outbound (remote unix-socket))
+  (allow network-bind (local unix-socket))
+  (allow network-inbound (local unix-socket))"#
             .to_string()
     };
 
@@ -810,12 +816,12 @@ pub fn spawn_claude(
     // Preserve the inherited TMPDIR when present. macOS login/terminal sessions
     // set TMPDIR to the per-user /var/folders/.../T dir (mode 0700, OS-managed,
     // not symlink-attackable, and covered by the /private/var/folders carve-out).
-    // Claude Code keys its SendMessage IPC sockets off $TMPDIR, so overriding it
-    // here strands those sockets in /tmp/claude.<uid> where non-sandboxed sessions
-    // (and a pre-existing `claude --bg` daemon) can't find them — silently
-    // breaking cross-session agent messaging. Only fall back to a verified per-uid
-    // /tmp dir when TMPDIR is unset (e.g. headless/cron), avoiding the world-
-    // writable /tmp default that Node/Bun would otherwise pick.
+    // Keeping it means the sandboxed Claude's temp state lands where the rest of the
+    // user's tooling expects it, rather than in a divergent per-session dir. (The
+    // cross-session SendMessage mesh does not live here — those listeners are in
+    // /private/tmp/cc-socks, allowed by the scoped network-bind rule in the profile.)
+    // Only fall back to a verified per-uid /tmp dir when TMPDIR is unset (e.g.
+    // headless/cron), avoiding the world-writable /tmp default that Node/Bun would pick.
     if std::env::var_os("TMPDIR").is_none() {
         let tmp_claude = ensure_user_tmpdir()?;
         cmd.env("TMPDIR", &tmp_claude);
@@ -1151,6 +1157,11 @@ mod tests {
         .unwrap();
         assert!(profile.contains(r#"(remote ip "localhost:*")"#));
         assert!(!profile.contains("(allow network*)"));
+        // Unix-domain sockets: connect, bind, and accept all allowed (needed for the
+        // Claude Code IPC mesh; see the network-rules comment).
+        assert!(profile.contains("(allow network-outbound (remote unix-socket))"));
+        assert!(profile.contains("(allow network-bind (local unix-socket))"));
+        assert!(profile.contains("(allow network-inbound (local unix-socket))"));
     }
 
     #[test]
